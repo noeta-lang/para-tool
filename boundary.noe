@@ -1,0 +1,111 @@
+// `para.tool.boundary` — which functions in this program can a language model reach, and did this
+// program declare all of them?
+//
+//     use para.tool.boundary
+//
+//     @test {
+//         fn no_dependency_offers_tools_to_this_programs_model(): void {
+//             assert(boundary.declared_outside(["app"]) == [], "${boundary.declared_outside(["app"])}")
+//         }
+//     }
+//
+// **This module is not a filter, and keeping it out of `Local` is the point.** Choosing which of
+// your own tools a given consumer gets is routing, and it lives on `Local` as `under`/`only`/
+// `except`. Discovering that a *dependency* is offering functions to your model is a trust-boundary
+// question with a different answer — a bug report against that package — and the two get confused
+// the moment they share a surface. So they do not share one. The doors here speak in fully qualified
+// reflection targets (`app.tools.weather`), where `Local` speaks in model-facing names (`weather`),
+// which means a value from one cannot be quietly passed to the other.
+//
+// **What makes the question necessary.** `attributes_of::<Tool>()` is whole-program and
+// closed-world, and "whole program" includes every dependency package — which is exactly what makes
+// `#[Tool]` work across a package boundary at all: the query runs inside a library and finds tools
+// declared in the application. The same reach points the other way. A `#[Tool]` declared at module
+// level inside a library is discovered from every application that depends on it, and a `Local`
+// offers it to that application's model with no line of the application mentioning it.
+//
+// Measured rather than assumed. In a two-package probe where the library declared two module-level
+// `#[Tool]` functions, the consuming application's `attributes_of::<Tool>()` answered
+// `["probe.lib.lib_module_level_tool", "probe.lib.lib_second_module_level_tool",
+// "probe_app.main.app_weather"]` — under `noeta run` and under `noeta test` alike, and identically
+// whether the query ran in the application or inside the library. A fixture inside a `@test` block
+// did **not** appear, because a dev tier is stripped before lowering on any build that is not that
+// module's own `noeta test`.
+//
+// So the rule a library follows is: its own `#[Tool]` fixtures live in `@test` blocks, carrying
+// `#[std.test.Skip]` so the runner does not call them as tests. `para/tool` holds itself to it, and
+// `examples/routing` asserts it from the consuming side — which is the only side that can see it.
+use tool.{Tool, under_namespace}
+
+// Every `#[Tool]` in the program, as its fully qualified reflection target, in declaration order.
+//
+// The review surface: the complete set of functions a language model could be handed, before any
+// selection narrows it. `roles_of::<Semantic>()` filtered to `Semantic.TrustBoundary` answers a
+// wider question — every declaration tagged as crossing a trust boundary, whether or not it is a
+// tool — and is what a reviewer reaches for. This one is about tools.
+pub fn crossings(): List<string> {
+    mut out: List<string> = []
+    for a in attributes_of::<Tool>() {
+        out = out ~ [a.target]
+    }
+    return out
+}
+
+// Every `#[Tool]` in the program declared **outside** the namespaces this program owns.
+//
+// `roots` is what the application considers its own — its manifest `root`, usually, and any other
+// prefix it means to vouch for. Anything left over was declared somewhere the application does not
+// control, and was going to be offered to its model anyway.
+//
+// The empty list is the answer you want. A non-empty one names the declarations, fully qualified, so
+// the first segment tells you which package to file against.
+//
+// A program that passes no roots gets every tool back, which is the honest reading of "I vouch for
+// nothing" rather than an error.
+pub fn declared_outside(roots: List<string>): List<string> {
+    mut out: List<string> = []
+    for target in crossings() {
+        mut owned = false
+        for root in roots {
+            if under_namespace(target, root) {
+                owned = true
+            }
+        }
+        if !owned {
+            out = out ~ [target]
+        }
+    }
+    return out
+}
+
+@test {
+    // The doors agree with the reflection index they read. This module declares no `#[Tool]` of its
+    // own — deliberately, since a module-level one here would be the very defect the module exists
+    // to report — so the fixtures it reasons about are `tool.noe`'s, and a dev tier is active for
+    // the entry file alone. From *this* entry, `tool.noe`'s `@test`-block fixtures are stripped and
+    // its module-level declarations carry no `#[Tool]`, so the program under test declares nothing.
+    //
+    // That is a real assertion rather than a vacuous one: it is the same shape a well-behaved
+    // dependency presents to a consumer, and it fails the moment this package grows a module-level
+    // `#[Tool]`. The consuming-side version, which is the one that can see a leak from a *different*
+    // package, is `examples/routing`.
+    fn a_well_behaved_package_contributes_no_tools(): void {
+        assert(crossings() == [], "para/tool must declare no `#[Tool]` outside a dev tier: ${crossings()}")
+        assert(declared_outside(["app"]) == [], "${declared_outside(["app"])}")
+    }
+
+    // Vouching for nothing returns everything, which is the honest reading rather than an error.
+    // Asserted against a synthetic index so it holds whatever the program happens to declare.
+    fn ownership_is_a_prefix_question_at_a_segment_boundary(): void {
+        assert(under_namespace("app.internal.wipe", "app.internal"))
+        assert(under_namespace("app.internal.wipe", "app"))
+        // The boundary is the whole of it: a raw string prefix would make `app.int` own
+        // `app.internal.wipe`, which is a claim nobody wrote.
+        assert(!under_namespace("app.internal.wipe", "app.int"))
+        assert(!under_namespace("app.internal.wipe", "other"))
+        // A namespace naming the target exactly owns it — one tool spelled by its qualified name.
+        assert(under_namespace("app.internal.wipe", "app.internal.wipe"))
+        // An empty root vouches for nothing, rather than for everything.
+        assert(!under_namespace("app.internal.wipe", ""))
+    }
+}

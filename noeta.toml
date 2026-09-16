@@ -1,0 +1,26 @@
+[package]
+name = "para/tool"
+version = "0.1.0"
+# The minimum noeta this package works with; enforced at resolve time from noeta 0.2.1 on. 0.8 is a
+# floor rather than a preference, and two things set it. `FieldSpec.attrs` carries a field's own
+# `#[...]` attributes, which is what lets one `help_of` serve the parameter door and the type door
+# instead of each scanning the whole-program attribute index. And `variants_of` is what tells a
+# declared enum apart from a field-less struct, without which the nominal schema walk is silently
+# wrong for every enum it meets. Both are load-bearing here rather than conveniences.
+toolchain = ">=0.8"
+license = "MIT OR Apache-2.0"
+description = "The `#[Tool]` attribute and the machinery that describes and invokes one: JSON Schema from a signature, argument coercion, and a collision-checked toolbox."
+keywords = ["tool", "agent", "mcp", "reflection", "schema"]
+
+# No `[dependencies]`, and that is the point of the package rather than a fact about its current
+# size. `#[Tool]` is an agent concept that two different kinds of consumer need — an agent harness
+# offering functions to a model, and an MCP server exposing them over a wire — and Noeta reflection
+# is keyed by attribute *type*, so two separately-declared `Tool` structs are mutually invisible with
+# no diagnostic. One declaration has to be shared, which means it lives below both of them.
+#
+# Noeta has no optional dependencies and no feature flags, so every edge here would be unconditional:
+# a single dependency on a protocol or on a harness would make every consumer of this layer carry it.
+# A dependency added here is therefore a design change, not a convenience.
+
+# No `[trust] native` either: this package is pure Noeta and ships no extension crate, so a consumer
+# authorizes nothing to depend on it.

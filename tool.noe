@@ -1,0 +1,2504 @@
+// `para.tool` — the function signature is the tool spec.
+//
+//     use para.tool.{Tool, Arg, Local}
+//
+//     #[Tool(about: "Current weather for a city")]
+//     fn weather(
+//         #[Arg(help: "City name, e.g. 'Malmö'")] city: string,
+//         #[Arg(help: "metric or imperial")] units: string = "metric",
+//     ): Result<string, string> {
+//         return Ok("18°C, clear")
+//     }
+//
+//     box = Toolbox.of(Local.new())?
+//
+// **What this package is for.** `#[Tool]` is an *agent* concept: a function a language model may
+// call. Serving those functions over MCP is one thing you can do with them and offering them to a
+// model in a run loop is another, so two different packages want the same attribute. Noeta
+// reflection is keyed by attribute **type**, so two separately-declared `Tool` structs are mutually
+// invisible to each other's `attributes_of::<Tool>()`, with no diagnostic at all — the second
+// package's tools would simply never appear. One declaration therefore has to sit below both
+// consumers, and everything that is purely about *describing and invoking* a tool sits with it.
+// What stays above is what is shaped like its consumer: a run loop's `dispatch`, a protocol's
+// framing, an agent's structured-output `Output`.
+//
+// There is no tool-definition DSL and no codegen, because the language already answers every
+// question one would ask. The whole pipeline is four reflection primitives:
+//
+//   * `attributes_of::<Tool>()` — every `#[Tool]` in the *consumer's* program, materialized as a
+//     real `Tool` struct paired with the annotated function's name. Whole-program reflection is
+//     closed-world, so this crosses the package boundary: the query runs here, the tools live over
+//     there, and it still sees them.
+//   * `params_of(target)`       — each parameter's name, declared `Type`, whether it is `optional`
+//     (it declared a default), and its own `#[Arg(...)]` metadata. That is the JSON Schema.
+//   * `field_specs_of(name)` / `variants_of(name)` — the declaration-side pair, asked **together**.
+//     A struct-typed parameter expands into a nested object schema and is built back with
+//     `construct`; an enum is told apart from a field-less struct by the second query, which is the
+//     only thing that can tell them apart at all.
+//   * `invoke(target, args)`    — call it by name. It returns `Result<dyn, dyn>` and **never aborts
+//     on a resolution failure**, which is what makes a bad tool call a turn instead of an outage.
+//
+// **The `Type` → JSON Schema walk here is the one walk.** `schema_of` is the callable door and
+// `schema_for` is the type door, and `json_schema` is the one total function underneath both — so a
+// struct-typed parameter and a struct-typed field produce byte-identical fragments, and there is
+// exactly one place a schema bug can live. A consumer deriving a schema for a declared *type*
+// (structured output, a resource description) calls `schema_for` rather than growing a second copy.
+//
+// **Tools are a trust boundary, and the package says so.** `Tool` carries
+// `@role(Semantic.TrustBoundary)`, which turns "which functions in this program can a language model
+// reach?" into a query — `roles_of::<Semantic>()` in-language, `para.tool.boundary` for the two
+// shapes of that question worth a named door, and the architectural graph `noeta mcp` serves to an
+// editor or an agent. For a program where a model can call code that is not a nicety; it is the
+// review surface.
+//
+// **A failing tool is a turn, not an outage.** An unknown name, a missing argument, an argument that
+// will not coerce, and a tool that returns `Err` all become a `ToolError` the caller hands back to
+// the model, which then gets to try something else. A panic *inside* a tool body is still a panic,
+// and that is correct: `invoke` catches by-name resolution, not the callee.
+use std.json
+
+// --- Errors ---------------------------------------------------------------------------------------
+
+// What can go wrong between a declaration and a call.
+//
+// Three variants, and the split is by **who can act on it**. `Tool` is a failure a model can be told
+// about and retry around. `Source` is a failure of the machinery a tool arrived through, which a
+// model cannot work around and should not be asked to. `Selection` is a failure of the program's own
+// configuration, which no model is involved in at all — a selector naming something that does not
+// exist is a typo in the application, and reporting it as a tool failure would send someone reading
+// the wrong code.
+//
+// A consumer with a richer error type maps this into it at the seam. That is the right direction:
+// this layer knows what a tool is and nothing about transports, run loops, or protocols, so an
+// error it raises must not pretend to.
+@derive(Equatable)
+pub enum ToolError {
+    // A tool failed in a way the model *can* be asked to recover from, or a tool declaration is
+    // malformed in a way that is nobody's runtime fault: an underivable schema, a name collision
+    // across sources, an argument that will not coerce, a tool that returned `Err`.
+    Tool(name: string, message: string)
+
+    // A `ToolSource` failed *as a source* — it would not start, it exited, it broke its protocol, it
+    // was asked for a capability it never advertised. `source` is the source's own `source_name()`,
+    // so it is the same string a collision message prints; `code` is drawn from a fixed,
+    // low-cardinality set by whoever raises it, so it stays matchable and safe as a metric
+    // attribute.
+    //
+    // Nothing in this package raises it, because the only source here is `Local` and reflection
+    // cannot fail as a transport. It exists because `ToolSource` is the seam a second consumer
+    // implements — an MCP client's server dies, and "the server exited with status 3" has to survive
+    // the trip through this layer rather than being flattened into a tool's name.
+    Source(source: string, code: string, message: string)
+
+    // A selection named something the program does not declare. Always a configuration error, never
+    // a model's: see `Local.under`.
+    Selection(message: string)
+
+    impl Display {
+        pub fn to_string(): string {
+            return match self {
+                ToolError.Tool(name, message) => if name == "" then "tool call failed: ${message}" else "tool `${name}` failed: ${message}",
+                ToolError.Source(source, code, message) => "tool source `${source}` failed (${code}): ${message}",
+                ToolError.Selection(message) => "tool selection: ${message}",
+            }
+        }
+    }
+}
+
+// --- The attributes ---------------------------------------------------------------------------
+
+// Marks a function as reachable by a language model. `about` is the description the model reads —
+// it is the whole prompt for *when* to call this, so it is worth writing well. `name` overrides the
+// model-facing name, which otherwise is the function's own.
+//
+// `@role(Semantic.TrustBoundary)` is the load-bearing line. It is indexed at build time at zero
+// runtime cost, and it is what makes the set of model-reachable functions answerable by a query
+// rather than by a bespoke linter.
+//
+// `Method` is in the target list because `invoke(recv, name, args)` can dispatch one and a future
+// `ToolSource` over an object is a real shape — but `Local` has no receiver to supply, so it
+// rejects a `#[Tool]` method loudly rather than silently omitting it.
+@attribute(Function, Method)
+@role(Semantic.TrustBoundary)
+pub struct Tool {
+    about: string = ""
+    name: string = ""
+}
+
+// Per-parameter and per-**field** metadata. `help` becomes the `description` in the derived JSON
+// Schema, which is the only place a model learns what a bare `string` is *for* — an enum-valued
+// parameter or field spelled as a string names its accepted values here.
+//
+// `Field` is in the target list because the type door (`schema_for`) walks a declared type's fields
+// through exactly the walk the parameter door walks a signature's parameters, and a description is
+// not a property of which door you came through. Both doors read it through the one `help_of`, off
+// the `attrs` list the descriptor itself carries — `ParamInfo.attrs` for a parameter,
+// `FieldSpec.attrs` for a field.
+@attribute(Param, Field)
+pub struct Arg {
+    help: string = ""
+}
+
+// --- What a consumer is told ----------------------------------------------------------------------
+
+// One tool, as a protocol-neutral description. `parameters` is a **JSON Schema object as raw JSON
+// text**, which keeps the parse/serialize boundary in one place and keeps `ToolSpec` a plain value
+// struct that derives `Equatable` and `Display` — so a test can assert on the exact schema a
+// signature produced.
+@derive(Equatable, Display)
+pub struct ToolSpec {
+    name: string
+    description: string = ""
+    parameters: string
+}
+
+// --- The source seam ------------------------------------------------------------------------------
+
+// Where tools come from. Local `#[Tool]` functions, an MCP server, and a hand-built table are the
+// same thing to a consumer, which holds a `Toolbox` of these and never asks which is which.
+//
+// **`specs` returns a `Result`.** Deriving a schema can fail — a parameter whose declared type has
+// no JSON representation is a bug in the tool, and reporting it as an empty schema would send a
+// model arguments the function cannot accept. A source has to be able to refuse what it cannot
+// express, loudly, naming the offending part. It is also what a remote source needs: an MCP
+// `tools/list` is a network call.
+pub trait ToolSource {
+    // A stable, low-cardinality identity — `"local"`, `"mcp:memory"`. It appears in the collision
+    // error naming both sources, so it has to be recognizable in a message.
+    fn source_name(): string
+
+    // The tool type every tool from this source reports: `"function"` or `"mcp"`. It is
+    // `gen_ai.tool.type` in the OpenTelemetry GenAI conventions, which is why the spelling is fixed
+    // rather than free text.
+    fn tool_type(): string
+
+    // Every tool this source offers, with its derived schema.
+    fn specs(): Result<List<ToolSpec>, ToolError>
+
+    // Run one, by its model-facing name, with its raw JSON argument blob. `Err` is not fatal: a
+    // consumer turns it into a failed tool result and lets the model try again.
+    fn call(name: string, args: string): Result<string, ToolError>
+}
+
+// --- Local: reflection over `#[Tool]` --------------------------------------------------------------
+
+// Every `#[Tool]` function in the program, or a **named subset** of them.
+//
+// The selection is three plain lists of strings and there is deliberately no predicate anywhere on
+// this type. Two reasons, and the second is the sharper one:
+//
+//   * **A tool set must not vary between one caller and the next.** The MCP specification requires
+//     that a server's `tools/list` not differ per connection, and a closure is an invitation to
+//     exactly that — a predicate reading a clock, a request, or a mutable table produces a server
+//     whose vocabulary is different for every client and a run loop whose transcript cannot be
+//     replayed. Here the reflection index is compile-time and the selection is immutable data, so
+//     `specs()` is a pure function of the constructed value: it answers the same list every time it
+//     is asked, and there is no way to write one that does not.
+//   * A selection you can print is a selection you can review. `under("app.exposed")` is legible in
+//     a diff in a way that a lambda is not.
+//
+// **Selection routes your own tools. It is not how you contain a dependency's leak.** Those are two
+// different problems that touch the same surface, and confusing them is how a security defect gets
+// filed as a configuration preference. A dependency that declares a module-level `#[Tool]` is
+// offering functions to *your* model that your program never mentioned; narrowing `Local` until they
+// fall outside the selection hides that rather than fixing it, and the next tool the dependency adds
+// is hidden too. `para.tool.boundary` is the door for that question, it speaks in fully qualified
+// reflection targets rather than in model-facing names precisely so the two cannot be casually
+// swapped, and the fix is a bug report against the dependency.
+//
+// Stateless otherwise — the reflection index is compile-time, so there is nothing to build and
+// nothing to keep.
+@derive(Equatable, Display)
+pub struct Local {
+    // Namespace prefixes, matched against the fully qualified reflection target at a segment
+    // boundary. Empty means every `#[Tool]` in the program.
+    namespaces: List<string> = []
+    // Model-facing names to keep, applied after the namespace filter. Empty means keep all of them.
+    keep: List<string> = []
+    // Model-facing names to drop, applied last.
+    drop: List<string> = []
+
+    // Every `#[Tool]` in the program.
+    //
+    // **This stays the default, and the alternative was measured rather than reasoned about.** The
+    // narrower default one would want — "only tools this application declared" — is not expressible
+    // at this layer: the reflection surface is entirely name-keyed, an `Attributed` carries a
+    // `.target` and a `.value` and nothing that says which package a declaration came from, and
+    // nothing tells a library which root the entry program derives under. A default that guessed
+    // would guess wrong. More importantly, a default that silently dropped a dependency's tools
+    // would make the leak *invisible* at exactly the layer that exists to make it visible. Loud and
+    // wrong beats quiet and wrong here: a consumer that sees a tool it did not declare has found a
+    // bug, and one that never sees it has the bug anyway.
+    pub fn new(): Local {
+        return Local {}
+    }
+
+    // Narrow to the `#[Tool]` functions declared under a namespace — `Local.new().under("app.agent")`.
+    //
+    // **The namespace is a selector you get for free.** A reflection target is already fully
+    // qualified (`app.agent.weather`), and the model-facing name is already derived from its last
+    // segment, so the module path is structure the compiler tracks and keeps correct across a rename
+    // or a move. A string tag on the attribute would be a second vocabulary saying the same thing,
+    // with nothing keeping the two in agreement.
+    //
+    // Repeatable, and the namespaces union: `.under("app.agent").under("app.shared")` offers both.
+    // Matching is at a segment boundary, so `under("app.int")` does not select `app.internal.x`.
+    //
+    // A namespace under which nothing is declared is an error at `specs()`, not an empty selection.
+    // A silently empty tool set surfaces as "the model never calls my tools", three layers from the
+    // typo that caused it.
+    pub fn under(ns: string): Local {
+        return Local { namespaces: self.namespaces ~ [ns], keep: self.keep, drop: self.drop }
+    }
+
+    // Narrow to specific tools by their **model-facing** names — the vocabulary the model is handed,
+    // which is what a reader of this line is thinking in. Applied after `under`, so the two compose.
+    //
+    // Repeatable, and the names union. A name that selects nothing is an error at `specs()`.
+    pub fn only(names: List<string>): Local {
+        return Local { namespaces: self.namespaces, keep: self.keep ~ names, drop: self.drop }
+    }
+
+    // Drop specific tools by their model-facing names — the exception to an otherwise whole
+    // namespace. Applied last, so `.under(ns).except([one])` reads in the order it happens.
+    //
+    // A name that drops nothing is an error at `specs()`: a redundant exclusion is how someone
+    // believes they have excluded something they have not.
+    pub fn except(names: List<string>): Local {
+        return Local { namespaces: self.namespaces, keep: self.keep, drop: self.drop ~ names }
+    }
+
+    impl ToolSource {
+        pub fn source_name(): string {
+            return "local"
+        }
+
+        pub fn tool_type(): string {
+            return "function"
+        }
+
+        pub fn specs(): Result<List<ToolSpec>, ToolError> {
+            selected = self.selected()?
+            mut out: List<ToolSpec> = []
+            mut claimed: List<string> = []
+            for d in selected {
+                // `invoke(name, args)` searches the top-level function namespace and nothing else,
+                // and a `Local` source holds no receiver to reach a method through. Loud rather than
+                // silently absent: a tool the model was never told about is indistinguishable, from
+                // the outside, from a tool it decided not to call.
+                //
+                // Applied to the *selection* rather than to the program, which is a real improvement
+                // over checking everything: one malformed `#[Tool]` method somewhere in the program
+                // no longer makes every `Local` in it unbuildable.
+                if is_method_target(d.target) {
+                    return Err(ToolError.Tool(
+                        name: d.name,
+                        message: "`#[Tool]` on the method `${d.target}` has no dispatch path: `invoke(name, args)` resolves top-level functions only, and `Local` has no receiver to supply — make it a top-level `fn`",
+                    ))
+                }
+                // Two `#[Tool]` functions of the same short name in different namespaces would
+                // collide in the model's vocabulary, and one would silently shadow the other. Same
+                // rule as a cross-source collision, and for the same reason — but the two
+                // *declarations* are what a reader needs here, since both are the one source.
+                if claimed.contains(d.name) {
+                    return Err(ToolError.Tool(
+                        name: d.name,
+                        message: "two `#[Tool]` declarations claim the name `${d.name}` — one of them is `${d.target}`; give one an explicit `#[Tool(name: …)]`, or select only one of them",
+                    ))
+                }
+                claimed = claimed ~ [d.name]
+                mut schema = ""
+                match schema_of(d.target) {
+                    Ok(s) => {
+                        schema = s
+                    },
+                    Err(e) => {
+                        return Err(ToolError.Tool(name: d.name, message: e))
+                    },
+                }
+                out = out ~ [ToolSpec { name: d.name, description: d.about, parameters: schema }]
+            }
+            return Ok(out)
+        }
+
+        pub fn call(name: string, args: string): Result<string, ToolError> {
+            // Resolved against the **selection**, not against the program. A tool this `Local` did
+            // not offer is not callable through it, which is the property that makes selection a
+            // routing decision rather than a display filter: an MCP server handed
+            // `Local.new().under("app.exposed")` cannot be talked into calling `app.internal.wipe`
+            // by a client that guessed the name.
+            selected = self.selected()?
+            mut target = ""
+            for d in selected {
+                if d.name == name {
+                    target = d.target
+                }
+            }
+            if target == "" {
+                return Err(ToolError.Tool(name: name, message: "no `#[Tool]` function is named `${name}`"))
+            }
+            params = params_of(target)
+            supplied = parse_arguments(name, args)?
+            bound = bind(name, params, supplied)?
+            // Every resolution failure is an `Err` here, never an abort — an arity mismatch, a name
+            // that vanished between `specs()` and now. It becomes a tool-result turn like any other.
+            return match invoke(target, bound) {
+                Ok(v) => outcome(name, v),
+                Err(e) => Err(ToolError.Tool(name: name, message: "${e}")),
+            }
+        }
+    }
+
+    // The declared tools this selection covers, in declaration order, with every selector that
+    // matched nothing reported.
+    //
+    // **An unmatched selector is an error rather than a no-op**, and all three kinds are checked
+    // together so one run reports every typo rather than the first one. The failure this prevents is
+    // specific: a selection that quietly matches nothing produces a model with no tools and a server
+    // with an empty `tools/list`, which looks like a model that decided not to call anything.
+    fn selected(): Result<List<Declared>, ToolError> {
+        all = declared_tools()
+        mut chosen: List<Declared> = []
+        for d in all {
+            if self.namespaces.len() == 0 || any_prefix(self.namespaces, d.target) {
+                chosen = chosen ~ [d]
+            }
+        }
+        for ns in self.namespaces {
+            if !any_target_under(all, ns) {
+                return Err(ToolError.Selection(
+                    "no `#[Tool]` is declared under `${ns}` — the program declares ${listed(targets_of(all))}",
+                ))
+            }
+        }
+        if self.keep.len() > 0 {
+            mut kept: List<Declared> = []
+            for d in chosen {
+                if self.keep.contains(d.name) {
+                    kept = kept ~ [d]
+                }
+            }
+            for name in self.keep {
+                if !any_named(chosen, name) {
+                    return Err(ToolError.Selection(
+                        "`only` names `${name}`, which is not among the selected tools ${listed(names_of(chosen))}",
+                    ))
+                }
+            }
+            chosen = kept
+        }
+        for name in self.drop {
+            if !any_named(chosen, name) {
+                return Err(ToolError.Selection(
+                    "`except` names `${name}`, which is not among the selected tools ${listed(names_of(chosen))} — a redundant exclusion is how a tool stays exposed after someone believed they had removed it",
+                ))
+            }
+        }
+        mut out: List<Declared> = []
+        for d in chosen {
+            if !self.drop.contains(d.name) {
+                out = out ~ [d]
+            }
+        }
+        return Ok(out)
+    }
+}
+
+// A discovered `#[Tool]`, flattened out of the reflection view.
+struct Declared {
+    // The model-facing name: `#[Tool(name: …)]`, or the function's own name.
+    name: string
+    // The reflection key `params_of` and `invoke` take.
+    target: string
+    about: string
+}
+
+fn declared_tools(): List<Declared> {
+    mut out: List<Declared> = []
+    for a in attributes_of::<Tool>() {
+        out = out ~ [Declared {
+            name: if a.value.name == "" then last_segment(a.target) else a.value.name,
+            target: a.target,
+            about: a.value.about,
+        }]
+    }
+    return out
+}
+
+// Does a reflection target lie under a namespace, at a **segment boundary**?
+//
+// The boundary is the whole of it. A raw string prefix would make `under("app.int")` select
+// `app.internal.wipe_everything`, which is a selection nobody wrote and the kind of near-miss a typo
+// produces. The namespace itself also matches, so `under("app.tools.weather")` selects that one
+// function — a degenerate but legitimate way to spell a single tool by its qualified name.
+pub fn under_namespace(target: string, ns: string): bool {
+    if ns == "" {
+        return false
+    }
+    if target == ns {
+        return true
+    }
+    return target.starts_with(ns ~ ".")
+}
+
+fn any_prefix(namespaces: List<string>, target: string): bool {
+    for ns in namespaces {
+        if under_namespace(target, ns) {
+            return true
+        }
+    }
+    return false
+}
+
+fn any_target_under(all: List<Declared>, ns: string): bool {
+    for d in all {
+        if under_namespace(d.target, ns) {
+            return true
+        }
+    }
+    return false
+}
+
+fn any_named(chosen: List<Declared>, name: string): bool {
+    for d in chosen {
+        if d.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn targets_of(all: List<Declared>): List<string> {
+    mut out: List<string> = []
+    for d in all {
+        out = out ~ [d.target]
+    }
+    return out
+}
+
+fn names_of(all: List<Declared>): List<string> {
+    mut out: List<string> = []
+    for d in all {
+        out = out ~ [d.name]
+    }
+    return out
+}
+
+fn listed(items: List<string>): string {
+    if items.len() == 0 {
+        return "none at all"
+    }
+    return items.join(", ")
+}
+
+// A reflection key's last segment. The model-facing name defaults to this rather than to the whole
+// key, because a key is **qualified** — a `#[Tool] fn weather` in the module `app.tools` is keyed
+// `app.tools.weather`, and every vendor and protocol constrains a tool name to `[A-Za-z0-9_-]`,
+// which a dotted path is not. Two tools that shorten to the same name are a collision, and `specs`
+// refuses it naming both declarations.
+//
+// `pub` because it is the one rule that derives a model-facing name from a reflection identity, and
+// a consumer describing something other than a callable — a declared type, a resource — needs the
+// same rule rather than a second one that agrees by accident.
+pub fn last_segment(target: string): string {
+    parts = target.split(".")
+    return parts[parts.len() - 1]
+}
+
+// Everything before a reflection key's last segment: `para.tool` for the free function
+// `para.tool.shout`, `para.tool.Toolbox` for the method `para.tool.Toolbox.call`.
+fn owner_of(target: string): string {
+    parts = target.split(".")
+    if parts.len() < 2 {
+        return ""
+    }
+    mut prefix: List<string> = []
+    mut i = 0
+    while i < parts.len() - 1 {
+        prefix = prefix ~ [parts[i]]
+        i = i + 1
+    }
+    return prefix.join(".")
+}
+
+// Does this reflection key name a method rather than a top-level function?
+//
+// Not "does it contain a dot": a reflection key is **qualified**, so a module's own free function is
+// keyed `tool.shout` and has plenty of dots. What distinguishes a method is its owner — the key
+// without its last segment names a declared type, which has a field schema. A method on a fieldless
+// struct or on an enum slips past this and is caught one layer down, where `invoke` reports it by
+// name ("a qualified name dispatches through the three-argument `invoke`").
+fn is_method_target(target: string): bool {
+    owner = owner_of(target)
+    return owner != "" && field_specs_of(owner).len() > 0
+}
+
+// A tool call's raw argument blob as a map. An empty blob is the no-arguments call, which some
+// vendors send as `""` rather than `"{}"`.
+fn parse_arguments(name: string, args: string): Result<Map<string, dyn>, ToolError> {
+    trimmed = args.trim()
+    if trimmed == "" {
+        empty: Map<string, dyn> = {}
+        return Ok(empty)
+    }
+    return match parse_object(trimmed, "tool `${name}` arguments") {
+        Ok(o) => Ok(o),
+        // Labeled a tool failure rather than a decode failure: it is the *model's* JSON that was
+        // malformed, so the model is who needs to be told.
+        Err(e) => Err(ToolError.Tool(name: name, message: e)),
+    }
+}
+
+// Parse a JSON document into a dynamic tree, **recoverably**.
+//
+// Two steps, because std has no recoverable dynamic door: `json.parse(text)` walks a document into
+// `Map`/`List`/scalars but *aborts* on malformed input, and `json.try_parse::<T>` is recoverable but
+// cannot build a `Map<string, dyn>`. So: prove well-formedness with a decodable type (which also
+// yields a path-carrying `JsonError`), then walk the proven-good document dynamically.
+//
+// Never call `json.parse` on a blob that came from a model. An abort here is a crashed process where
+// the whole design is a correction turn.
+//
+// `what` names the document in the error message, so a failure reads
+// ``tool `weather` arguments: invalid JSON: …`` rather than a bare parser complaint.
+fn parse_object(body: string, what: string): Result<Map<string, dyn>, string> {
+    match json.try_parse::<JsonObject>(body) {
+        Ok(_) => {},
+        Err(e) => {
+            return Err(if e.path() == "" then "${what}: ${e.message()}" else "${what} at ${e.path()}: ${e.message()}")
+        },
+    }
+    return Ok(json.parse(body).as<Map<string, dyn>>() ?? {})
+}
+
+// The well-formedness witness for `parse_object`. A field-less struct decodes from any JSON
+// **object** and rejects anything else (a scalar, an array, a syntax error) with the exact reason.
+@derive(Deserialize<Json>)
+struct JsonObject {
+}
+
+// Parse an arbitrary JSON **value** — an object, an array, or a scalar — recoverably.
+//
+// A tool call's raw `args` is an object, but a single argument fragment is not necessarily one, so
+// `parse_object` is too narrow for the general case. Wrapping the fragment in a one-key object
+// reuses the same well-formedness witness: a malformed fragment fails there, with the fragment's own
+// parser message, instead of aborting.
+pub fn parse_value(fragment: string, what: string): Result<dyn, string> {
+    wrapped = parse_object("{\"v\": " ~ fragment ~ "}", what)?
+    return Ok(wrapped.get("v") ?? 0)
+}
+
+// What `invoke` handed back, as the string the model will read.
+//
+// A tool declared `Result<T, E>` is unwrapped: `Ok(v)` is the answer, `Err(e)` is a failed turn.
+// That is the whole of "a failing tool is a turn, not an outage" — the model sees the error text
+// and gets to try something else.
+fn outcome(tool: string, v: dyn): Result<string, ToolError> {
+    return match v.as<Result<dyn, dyn>>() {
+        some(r) => match r {
+            Ok(x) => Ok(render(x)),
+            Err(e) => Err(ToolError.Tool(name: tool, message: render(e))),
+        },
+        none => Ok(render(v)),
+    }
+}
+
+// A returned value as text. A `string` is itself; everything else is JSON, because a struct, a
+// list, or a map is far more useful to a model as `{"temp":18,"sky":"clear"}` than as a Noeta
+// `Display` rendering it has never seen the grammar of.
+fn render(v: dyn): string {
+    return match v.as<string>() {
+        some(s) => s,
+        none => json.stringify(v),
+    }
+}
+
+// --- `Type` → JSON Schema ----------------------------------------------------------------------
+//
+// **Total over the `Type` ADT.** Every variant is either derived or refused with a message naming
+// the parameter, the type, and what to write instead. Nothing emits `{}` for a shape it did not
+// understand: a schema that silently says "any value" is how a model learns to send arguments the
+// function cannot accept, and the resulting failure lands three layers from its cause.
+
+// The whole object schema for one callable, as JSON text. Keys come out in `json.stringify`'s
+// sorted order, which is what makes an exact-string assertion on a derived schema stable.
+pub fn schema_of(target: string): Result<string, string> {
+    mut props: Map<string, dyn> = {}
+    mut required: List<dyn> = []
+    for p in params_of(target) {
+        mut schema: Map<string, dyn> = {}
+        match param_schema(p) {
+            Ok(s) => {
+                schema = s
+            },
+            Err(e) => {
+                return Err("parameter `${p.name}`: ${e}")
+            },
+        }
+        props = props.set(p.name, schema)
+        // A parameter that declared a default may be omitted, and so may an `?T` — an absent
+        // optional *is* `none`. Everything else is required.
+        if !p.optional && !is_option(p.type) {
+            required = required ~ [p.name]
+        }
+    }
+    obj: Map<string, dyn> = {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": false,
+    }
+    // The dispatcher rejects an argument no parameter accepts, so the schema says so too. A
+    // model that is told the object is closed sends fewer invented keys.
+    return Ok(json.stringify(obj))
+}
+
+// The whole object schema for one declared **type**, as JSON text — the door a structured reply or a
+// resource description takes, where `schema_of` is the door a callable takes.
+//
+// It is the same walk. A callable's `params_of` and a type's `field_specs_of` report the same
+// name/type/optional triple, so "the parameters of `weather`" and "the fields of `Extraction`"
+// produce byte-identical schemas for the same shapes, and there is exactly one place a schema bug
+// can live. No directive, no second derivation, and no instance of the type needed anywhere.
+pub fn schema_for(target: string): Result<string, string> {
+    // Deliberately routed through the nominal walk rather than opened by hand, so the type door and
+    // a nested field of the same type agree byte for byte — including the refusals.
+    return Ok(json.stringify(nominal_schema(target, [], [])?))
+}
+
+fn param_schema(p: ParamInfo): Result<Map<string, dyn>, string> {
+    // Asked *before* the schema, because a shape this module cannot build an argument for must not
+    // be described to a model at all — see `undispatchable`.
+    match undispatchable(p.type, []) {
+        some(why) => {
+            return Err(why)
+        },
+        none => {},
+    }
+    mut s = json_schema(p.type)?
+    help = help_of(p.attrs)
+    if help != "" {
+        s = s.set("description", help)
+    }
+    return Ok(s)
+}
+
+// The `#[Arg(help: …)]` on a member, narrowed off the heterogeneous `attrs` list its descriptor
+// carries. ONE function for both doors: a parameter's list comes off `ParamInfo.attrs` and a field's
+// off `FieldSpec.attrs`, and since both are a `List<dyn>` of materialized attribute instances there
+// is nothing left to tell apart. That is the whole of "the two doors derive the same bytes" — the
+// descriptors are the same shape, so the walk over them is the same code.
+//
+// **Why it matters more than it looks.** Without a field's `help`, a `#[Tool]` parameter can tell a
+// model what a bare `string` is for and a structured-output field cannot — so an output field whose
+// accepted values are `billing | shipping | technical | other` reaches the vendor as
+// `{"type": "string"}` and the model invents `"Lost order"`, which a validating decoder then
+// refuses. The repair round costs a model call to say what the schema could have said for free.
+fn help_of(attrs: List<dyn>): string {
+    for a in attrs {
+        if a is Arg {
+            return a.help
+        }
+    }
+    return ""
+}
+
+fn scalar(kind: string): Map<string, dyn> {
+    out: Map<string, dyn> = {"type": kind}
+    return out
+}
+
+// One declared type as a JSON Schema fragment, or the reason it has none.
+pub fn json_schema(t: Type): Result<Map<string, dyn>, string> {
+    return schema_at(t, [])
+}
+
+// The walk, carrying the chain of nominal types already being expanded.
+//
+// `seen` is what makes a self-referential declaration a refusal by name instead of a walk that
+// recurses until the stack runs out. JSON Schema spells a cycle with `$ref`, and no vendor's strict
+// structured-output mode accepts one uniformly — so emitting a `$ref` here would produce a schema
+// half the vendors reject, which is worse than saying no.
+fn schema_at(t: Type, seen: List<string>): Result<Map<string, dyn>, string> {
+    return match t {
+        Type.Int => Ok(scalar("integer")),
+        Type.Float => Ok(scalar("number")),
+        Type.Bool => Ok(scalar("boolean")),
+        Type.String => Ok(scalar("string")),
+        // A `dyn` parameter is *declared* to accept anything, so the empty schema is the honest
+        // reading rather than a shrug — JSON Schema spells "any value" exactly that way.
+        Type.Dyn => Ok(any_schema()),
+        // An `?T` parameter is `T`'s schema and an absence from `required`; JSON has no separate
+        // "optional" shape, and a `null` argument coerces back to `none` at dispatch.
+        Type.Option(inner) => schema_at(inner, seen),
+        Type.List(inner) => array_schema(inner, false, seen),
+        Type.Set(inner) => array_schema(inner, true, seen),
+        Type.Map(key, value) => map_schema(key, value, seen),
+        Type.Union(members) => union_schema(members, seen),
+        // A declared struct, class, or enum. `params_of` and `field_specs_of` both report every one
+        // of them **kind-agnostically** as `Type.Named(name, [])` — which is exactly why the two
+        // reflection queries have to be asked as a pair rather than the arm being trusted.
+        Type.Named(name, args) => nominal_schema(name, args, seen),
+        Type.Struct(name, args) => nominal_schema(name, args, seen),
+        Type.Class(name, args) => nominal_schema(name, args, seen),
+        Type.Enum(name, args) => nominal_schema(name, args, seen),
+        // The fixed-width numerics are a physically distinct storage slot in container position
+        // (`List<i32>` is packed), and a value built from JSON is not one. Rejecting is honest;
+        // handing a boxed int to a packed list is a wrong answer with no error.
+        Type.IntN(bits, signed) => Err("a fixed-width integer is not a tool-argument shape — its packed storage cannot be built from JSON; declare `int`"),
+        Type.F32 => Err("`f32` is not a tool-argument shape — its packed storage cannot be built from JSON; declare `float`"),
+        Type.F64 => Err("`f64` is not a tool-argument shape in container position — declare `float`"),
+        Type.Bytes => Err("`bytes` has no tool-argument encoding: a model sends text, so a `bytes` parameter cannot be built from its JSON — take a `string` and decode it in the tool"),
+        Type.Unit => Err("`void` is not a value a model can send"),
+        // `never` is the type of an expression that does not return. No value inhabits it,
+        // so there is nothing for a model to send — the same reading as `void`, one step
+        // stronger.
+        Type.Never => Err("`never` is not a value a model can send — no value inhabits it"),
+        Type.Result(ok, err) => Err("a `Result` parameter cannot be sent by a model — a tool *returns* a `Result`, it does not take one"),
+        Type.Fn(params, ret) => Err("a function-typed parameter has no JSON representation"),
+        Type.DynTrait(name) => Err("a `dyn ${name}` parameter has no JSON representation — a model can only send data"),
+    }
+}
+
+// JSON Schema's "any value". A real, deliberate schema, not an empty one that got away.
+fn any_schema(): Map<string, dyn> {
+    out: Map<string, dyn> = {}
+    return out
+}
+
+fn array_schema(inner: Type, unique: bool, seen: List<string>): Result<Map<string, dyn>, string> {
+    items = schema_at(inner, seen)?
+    mut out: Map<string, dyn> = {"type": "array", "items": items}
+    if unique {
+        out = out.set("uniqueItems", true)
+    }
+    return Ok(out)
+}
+
+fn map_schema(key: Type, value: Type, seen: List<string>): Result<Map<string, dyn>, string> {
+    if !is_string(key) {
+        return Err("a `Map` argument must be keyed by `string` — a JSON object's keys are strings")
+    }
+    values = schema_at(value, seen)?
+    out: Map<string, dyn> = {"type": "object", "additionalProperties": values}
+    return Ok(out)
+}
+
+fn union_schema(members: List<Type>, seen: List<string>): Result<Map<string, dyn>, string> {
+    mut branches: List<dyn> = []
+    for m in members {
+        branch = schema_at(m, seen)?
+        branches = branches ~ [branch]
+    }
+    out: Map<string, dyn> = {"anyOf": branches}
+    return Ok(out)
+}
+
+// A declared type's schema, from the two declaration-side reflection queries.
+//
+// **They are asked as a pair, and that is the whole point.** `field_specs_of` answers an enum with
+// the empty list — and a field-less struct with the empty list too, so through that query alone an
+// enum is *indistinguishable from an empty struct*. A walk that recursed on fields alone would emit
+// `{"type":"object","properties":{}}` for an enum and be silently wrong. With the pair: fields
+// present means a struct or class, variants present means an enum, and both empty is the one honest
+// "nothing is known about this name".
+fn nominal_schema(name: string, args: List<Type>, seen: List<string>): Result<Map<string, dyn>, string> {
+    if args.len() > 0 {
+        return Err("`${name}` is a generic instantiation, and reflection keys on the head name with the parameters erased — its fields would reflect in terms of `T`, which names nothing at run time; declare a concrete type")
+    }
+    if in_chain(seen, name) {
+        return Err("`${name}` is recursive — it reaches itself through ${chain_of(seen, name)}, and a JSON Schema for a cycle needs `$ref`, which no vendor's strict structured-output mode accepts uniformly")
+    }
+    variants = variants_of(name)
+    if variants.len() > 0 {
+        return enum_schema(name, variants)
+    }
+    fields = field_specs_of(name)
+    if fields.len() > 0 {
+        return object_schema(name, fields, seen ~ [name])
+    }
+    return Err("`${name}` declares neither fields nor variants — `field_specs_of` and `variants_of` are both empty, which is what a name nothing declares looks like, and what a field-less struct looks like too; neither has a schema worth sending")
+}
+
+// A declared struct or class as a closed JSON object schema, recursing through its fields to any
+// depth. A field that declared a default may be omitted, and so may an `?T`; everything else is
+// required — the same rule `schema_of` applies to a callable's parameters, because it is the same
+// question about the same `FieldSpec`/`ParamInfo` shape.
+fn object_schema(name: string, fields: List<FieldSpec>, seen: List<string>): Result<Map<string, dyn>, string> {
+    mut props: Map<string, dyn> = {}
+    mut required: List<dyn> = []
+    for f in fields {
+        mut one: Map<string, dyn> = {}
+        match schema_at(f.type, seen) {
+            Ok(s) => {
+                one = s
+            },
+            Err(e) => {
+                // The path is rebuilt on the way out, so a failure four levels down reads as
+                // `field \`A.b\`: field \`B.c\`: …` rather than as a bare complaint about a type.
+                return Err("field `${name}.${f.name}`: ${e}")
+            },
+        }
+        help = help_of(f.attrs)
+        if help != "" {
+            one = one.set("description", help)
+        }
+        props = props.set(f.name, one)
+        if !f.optional && !is_option(f.type) {
+            required = required ~ [f.name]
+        }
+    }
+    out: Map<string, dyn> = {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": false,
+    }
+    return Ok(out)
+}
+
+// A declared enum as `{"enum": […]}`.
+//
+// A **backed** enum's wire value is its backing, not its case name: `Status.Pending = "pending"` is
+// `"pending"` in every document that carries it, and emitting `"Pending"` would describe a shape
+// nothing produces. A plain enum has no backing, so its case names *are* the values.
+//
+// A variant carrying a **payload** is refused. A data-carrying sum type has no single conventional
+// JSON Schema — a tagged union wants `oneOf` plus a discriminator, and which spelling a vendor's
+// strict mode accepts differs between them — so guessing one would describe a document this package
+// could not read back. That is the same trade every other arm here makes.
+fn enum_schema(name: string, variants: List<VariantSpec>): Result<Map<string, dyn>, string> {
+    mut values: List<dyn> = []
+    mut backings = 0
+    for v in variants {
+        if v.payload.len() > 0 {
+            return Err("`${name}.${v.name}` carries a payload, and a data-carrying enum has no single JSON Schema spelling every vendor's strict mode accepts; use a payload-free enum, or a struct with a discriminant field")
+        }
+        match v.backing {
+            some(b) => {
+                values = values ~ [b]
+                backings = backings + 1
+            },
+            none => {
+                values = values ~ [v.name]
+            },
+        }
+    }
+    // A backed enum backs every case by declaration, so one reading of the first value types the
+    // whole set. A plain enum's values are its case names, which are strings.
+    kind = if backings == 0 then "string" else scalar_kind(values[0])
+    out: Map<string, dyn> = {"type": kind, "enum": values}
+    return Ok(out)
+}
+
+fn scalar_kind(v: dyn): string {
+    return match type_of(v) {
+        Type.Int => "integer",
+        Type.Float => "number",
+        Type.Bool => "boolean",
+        _ => "string",
+    }
+}
+
+fn in_chain(seen: List<string>, name: string): bool {
+    for s in seen {
+        if s == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn chain_of(seen: List<string>, name: string): string {
+    return (seen ~ [name]).join(" → ")
+}
+
+// --- What a tool argument can actually be *built* from --------------------------------------------
+//
+// `json_schema` is total and derives a real `{"enum": […]}` for a declared enum. The schema is
+// right, and a structured-output door uses it. **A tool parameter asks a second question**, though:
+// an argument has to be *built*, and nothing at run time can build an enum value from a name. Four
+// doors, and all four are shut:
+//
+//   * `@derive(Deserialize<Json>)` on a struct with an enum-typed field is **E0050 at check time**,
+//     so no such type can even be declared.
+//   * `construct(name, fields)` answers `` `X` is not a constructible struct or class ``.
+//   * `json.decode_typed(name, text)` needs the recipe the derive would have registered.
+//   * `Enum.from(case)` exists, but takes a **case name** rather than a backing value and **aborts**
+//     on an unknown one — unusable on anything that came off a wire, exactly like `json.parse`.
+//
+// So an enum-typed parameter stays refused, and the message says it is a missing runtime enum
+// *constructor* rather than a missing description. Deriving the schema and failing at dispatch would
+// be the worse trade: it teaches a model to send arguments the function cannot accept, which is the
+// one failure this module exists to prevent.
+//
+// A **struct** is a different answer: `construct` builds one, `coerce_struct` fills it, and the
+// nested-object schema is derived above. Struct-typed parameters therefore work end to end.
+fn undispatchable(t: Type, seen: List<string>): ?string {
+    return match t {
+        Type.Option(inner) => undispatchable(inner, seen),
+        Type.List(inner) => undispatchable(inner, seen),
+        Type.Set(inner) => undispatchable(inner, seen),
+        Type.Map(key, value) => undispatchable(value, seen),
+        Type.Union(members) => first_undispatchable(members, seen),
+        Type.Named(name, args) => undispatchable_nominal(name, seen),
+        Type.Struct(name, args) => undispatchable_nominal(name, seen),
+        Type.Class(name, args) => undispatchable_nominal(name, seen),
+        Type.Enum(name, args) => some(enum_argument_refusal(name)),
+        _ => none,
+    }
+}
+
+fn first_undispatchable(members: List<Type>, seen: List<string>): ?string {
+    for m in members {
+        match undispatchable(m, seen) {
+            some(why) => {
+                return some(why)
+            },
+            none => {},
+        }
+    }
+    return none
+}
+
+// A nominal name is an enum exactly when `variants_of` says so — the same pair `nominal_schema`
+// asks. A struct is walked field-wise, guarded by the same chain, so an enum three levels down is
+// refused at the parameter rather than discovered at the first model call.
+fn undispatchable_nominal(name: string, seen: List<string>): ?string {
+    if in_chain(seen, name) {
+        return none
+    }
+    if variants_of(name).len() > 0 {
+        return some(enum_argument_refusal(name))
+    }
+    for f in field_specs_of(name) {
+        match undispatchable(f.type, seen ~ [name]) {
+            some(why) => {
+                return some("field `${name}.${f.name}`: ${why}")
+            },
+            none => {},
+        }
+    }
+    return none
+}
+
+fn enum_argument_refusal(name: string): string {
+    return "`${name}` is an enum, and nothing at run time can build an enum value from JSON — `construct` takes structs and classes only, `Deserialize<Json>` refuses an enum-typed field at check time, and `Enum.from` takes a case name and aborts on an unknown one. Its `{\"enum\": …}` *schema* derives fine, so this is a missing constructor and not a missing description; declare the parameter `string` and name the accepted values in `#[Arg(help: …)]`"
+}
+
+fn is_option(t: Type): bool {
+    return match t {
+        Type.Option(inner) => true,
+        _ => false,
+    }
+}
+
+fn is_string(t: Type): bool {
+    return match t {
+        Type.String => true,
+        _ => false,
+    }
+}
+
+// --- Coercion ------------------------------------------------------------------------------------
+//
+// The decoded JSON argument for each parameter, coerced to its declared type. This is the package's
+// own type check and it is load-bearing: `invoke` validates a callable's *name* and *arity* and
+// nothing else, so an `int` parameter handed a string reaches the function body and aborts there —
+// which is a crashed process, not a tool-result turn. Nothing reaches `invoke` that did not come
+// through here.
+//
+// Deliberately lenient in one direction only: a scalar that a model sent in the neighboring JSON
+// type (`"5"` for an `int`, `5` for a `string`, `2.0` for an `int`) is accepted, because models do
+// that constantly and refusing costs a round trip for nothing. A *lossy* conversion is refused.
+
+fn is_null(v: dyn): bool {
+    return match type_of(v) {
+        Type.Unit => true,
+        _ => false,
+    }
+}
+
+// The one place a `Type` and a decoded JSON value meet. `pub` because it is half of the contract a
+// consumer needs to build an argument list by hand — a protocol server validating a request before
+// it reaches a toolbox asks exactly this question.
+pub fn coerce(t: Type, v: dyn): Result<dyn, string> {
+    if is_null(v) {
+        // JSON `null` for an `?T` is exactly `none`. For anything else it is a missing argument
+        // wearing a value's clothes.
+        return match t {
+            Type.Option(inner) => Ok(none),
+            _ => Err("expected ${spelling(t)}, got null"),
+        }
+    }
+    return match t {
+        Type.Int => coerce_int(v),
+        Type.Float => coerce_float(v),
+        Type.Bool => coerce_bool(v),
+        Type.String => coerce_string(v),
+        Type.Dyn => Ok(v),
+        Type.Option(inner) => coerce_option(inner, v),
+        Type.List(inner) => coerce_list(inner, v),
+        Type.Set(inner) => coerce_set(inner, v),
+        Type.Map(key, value) => coerce_map(value, v),
+        Type.Union(members) => coerce_union(members, v),
+        Type.Named(name, args) => coerce_struct(name, v),
+        Type.Struct(name, args) => coerce_struct(name, v),
+        Type.Class(name, args) => coerce_struct(name, v),
+        // Unreachable by construction: every remaining variant is refused by `param_schema`, so no
+        // tool carrying one ever reaches a `Toolbox`, let alone a dispatch. Loud anyway.
+        _ => Err("no coercion for ${spelling(t)}"),
+    }
+}
+
+// A JSON object as a declared struct or class value.
+//
+// **Every field is coerced before `construct` sees it, and that is load-bearing.** `construct`
+// validates a field's *presence* and nothing about its type: handed `{"inner": {"a": 2}}` for a
+// field declared `Inner` it stores the raw `Map` and answers `Ok`, and the wrong value survives an
+// `.as<Outer>()` narrowing to abort at the first field read with `no field \`b\` on map` — a crash
+// several layers from its cause. That is the same hole `invoke` has for arguments, and this module
+// closes it the same way: the coercion layer is the type check, and nothing reaches the builder
+// around it.
+//
+// A key no field declares is refused rather than dropped, because the derived schema says
+// `additionalProperties: false` and quietly ignoring a key the model believed it sent answers a
+// different question. An absent `?T` that declared no default is filled with `none` — `construct`
+// requires the slot even though the value is an absence.
+fn coerce_struct(name: string, v: dyn): Result<dyn, string> {
+    mut obj: Map<string, dyn> = {}
+    match v.as<Map<string, dyn>>() {
+        some(m) => {
+            obj = m
+        },
+        none => {
+            return Err("expected an object for `${name}`, got `${v}`")
+        },
+    }
+    fields = field_specs_of(name)
+    for k in obj.keys() {
+        if !has_field(fields, k) {
+            return Err("`${name}` has no field `${k}` — it takes ${field_names(fields)}")
+        }
+    }
+    mut built: Map<string, dyn> = {}
+    for f in fields {
+        match obj.get(f.name) {
+            some(raw) => {
+                match coerce(f.type, raw) {
+                    Ok(one) => {
+                        built = built.set(f.name, one)
+                    },
+                    Err(e) => {
+                        return Err("field `${name}.${f.name}`: ${e}")
+                    },
+                }
+            },
+            none => {
+                if is_option(f.type) {
+                    built = built.set(f.name, none)
+                } else if !f.optional {
+                    return Err("`${name}` requires the field `${f.name}`")
+                }
+            },
+        }
+    }
+    return match construct(name, built) {
+        Ok(value) => Ok(value),
+        Err(e) => Err("`${name}` would not build: ${e}"),
+    }
+}
+
+fn has_field(fields: List<FieldSpec>, name: string): bool {
+    for f in fields {
+        if f.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn field_names(fields: List<FieldSpec>): string {
+    mut names: List<string> = []
+    for f in fields {
+        names = names ~ [f.name]
+    }
+    if names.len() == 0 {
+        return "no fields"
+    }
+    return names.join(", ")
+}
+
+fn coerce_int(v: dyn): Result<dyn, string> {
+    match v.as<int>() {
+        some(n) => {
+            return Ok(n)
+        },
+        none => {},
+    }
+    // JSON has one number type, so a whole `2.0` is an integer that took the scenic route. A
+    // fractional one is not, and rounding it silently would answer a question nobody asked.
+    match v.as<float>() {
+        some(f) => {
+            if f == f.to_int().to_float() {
+                return Ok(f.to_int())
+            }
+            return Err("expected an integer, got the fractional number ${f}")
+        },
+        none => {},
+    }
+    match v.as<string>() {
+        some(s) => {
+            match s.to_int() {
+                some(n) => {
+                    return Ok(n)
+                },
+                none => {},
+            }
+        },
+        none => {},
+    }
+    return Err("expected an integer, got `${v}`")
+}
+
+fn coerce_float(v: dyn): Result<dyn, string> {
+    match v.as<float>() {
+        some(f) => {
+            return Ok(f)
+        },
+        none => {},
+    }
+    match v.as<int>() {
+        some(n) => {
+            return Ok(n.to_float())
+        },
+        none => {},
+    }
+    match v.as<string>() {
+        some(s) => {
+            match s.to_float() {
+                some(f) => {
+                    return Ok(f)
+                },
+                none => {},
+            }
+        },
+        none => {},
+    }
+    return Err("expected a number, got `${v}`")
+}
+
+fn coerce_bool(v: dyn): Result<dyn, string> {
+    match v.as<bool>() {
+        some(b) => {
+            return Ok(b)
+        },
+        none => {},
+    }
+    match v.as<string>() {
+        some(s) => {
+            if s == "true" || s == "1" {
+                return Ok(true)
+            }
+            if s == "false" || s == "0" {
+                return Ok(false)
+            }
+        },
+        none => {},
+    }
+    return Err("expected a boolean, got `${v}`")
+}
+
+fn coerce_string(v: dyn): Result<dyn, string> {
+    match v.as<string>() {
+        some(s) => {
+            return Ok(s)
+        },
+        none => {},
+    }
+    // A scalar sent for a string parameter reads back as its own text. An object or an array does
+    // not: stringifying those would hand the tool a JSON blob where it expected prose.
+    if is_scalar(v) {
+        return Ok("${v}")
+    }
+    return Err("expected a string, got `${v}`")
+}
+
+fn is_scalar(v: dyn): bool {
+    return match type_of(v) {
+        Type.Int => true,
+        Type.Float => true,
+        Type.Bool => true,
+        _ => false,
+    }
+}
+
+fn coerce_option(inner: Type, v: dyn): Result<dyn, string> {
+    value = coerce(inner, v)?
+    return Ok(some(value))
+}
+
+fn coerce_elements(inner: Type, v: dyn): Result<List<dyn>, string> {
+    items = match v.as<List<dyn>>() {
+        some(xs) => xs,
+        none => [],
+    }
+    match v.as<List<dyn>>() {
+        some(_) => {},
+        none => {
+            return Err("expected an array, got `${v}`")
+        },
+    }
+    mut out: List<dyn> = []
+    for (i, item) in items.enumerate() {
+        match coerce(inner, item) {
+            Ok(c) => {
+                out = out ~ [c]
+            },
+            Err(e) => {
+                return Err("[${i}]: ${e}")
+            },
+        }
+    }
+    return Ok(out)
+}
+
+fn coerce_list(inner: Type, v: dyn): Result<dyn, string> {
+    items = coerce_elements(inner, v)?
+    return Ok(items)
+}
+
+fn coerce_set(inner: Type, v: dyn): Result<dyn, string> {
+    items = coerce_elements(inner, v)?
+    return Ok(items.to_set())
+}
+
+fn coerce_map(value: Type, v: dyn): Result<dyn, string> {
+    obj = match v.as<Map<string, dyn>>() {
+        some(o) => o,
+        none => {},
+    }
+    match v.as<Map<string, dyn>>() {
+        some(_) => {},
+        none => {
+            return Err("expected an object, got `${v}`")
+        },
+    }
+    mut out: Map<string, dyn> = {}
+    for k in obj.keys() {
+        match coerce(value, obj[k]) {
+            Ok(c) => {
+                out = out.set(k, c)
+            },
+            Err(e) => {
+                return Err(".${k}: ${e}")
+            },
+        }
+    }
+    return Ok(out)
+}
+
+// The first branch that accepts wins, in declaration order — which is why a union's members are
+// worth writing most-specific-first.
+fn coerce_union(members: List<Type>, v: dyn): Result<dyn, string> {
+    for m in members {
+        match coerce(m, v) {
+            Ok(c) => {
+                return Ok(c)
+            },
+            Err(_) => {},
+        }
+    }
+    mut wanted: List<string> = []
+    for m in members {
+        wanted = wanted ~ [spelling(m)]
+    }
+    return Err("`${v}` matches no member of the union: expected ${wanted.join(" or ")}")
+}
+
+// A type as a short phrase for an error message. `Type`'s own `Display` is the ADT's spelling
+// (`Type.List(Type.String)`), which is right for a reflection dump and wrong in a sentence aimed at
+// a language model.
+fn spelling(t: Type): string {
+    return match t {
+        Type.Int => "an integer",
+        Type.Float => "a number",
+        Type.Bool => "a boolean",
+        Type.String => "a string",
+        Type.Bytes => "a byte string",
+        Type.Dyn => "any value",
+        Type.Unit => "nothing",
+        Type.List(inner) => "an array of ${spelling(inner)}",
+        Type.Set(inner) => "an array of distinct ${spelling(inner)}",
+        Type.Option(inner) => "${spelling(inner)} or null",
+        Type.Map(key, value) => "an object of ${spelling(value)}",
+        _ => "${t}",
+    }
+}
+
+// --- Binding -------------------------------------------------------------------------------------
+
+fn has_param(params: List<ParamInfo>, name: string): bool {
+    for p in params {
+        if p.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn param_names(params: List<ParamInfo>): string {
+    mut names: List<string> = []
+    for p in params {
+        names = names ~ [p.name]
+    }
+    if names.len() == 0 {
+        return "no arguments"
+    }
+    return names.join(", ")
+}
+
+// The model's arguments as the positional list `invoke` takes, in declaration order.
+//
+// Three things are decided here, and each one is a message the model can act on:
+//
+//   * An **unknown argument** is refused rather than dropped. The schema said the object is closed;
+//     quietly ignoring a key the model believed it sent produces an answer to a different question.
+//   * A **missing required argument** is refused, naming it.
+//   * A **gap** — a defaulted parameter left out while a later one is supplied — is refused,
+//     naming both. `invoke` takes a positional list and nothing else (unlike `construct`, whose
+//     named-map form can express a gap), so a skipped middle parameter is not expressible. The
+//     message asks for the skipped one rather than guessing at its default, which reflection does
+//     not expose.
+//
+// `pub` for the same reason `coerce` is: it is the other half of what a consumer building an
+// argument list by hand needs, and a second implementation of these three rules would drift.
+pub fn bind(tool: string, params: List<ParamInfo>, supplied: Map<string, dyn>): Result<List<dyn>, ToolError> {
+    for k in supplied.keys() {
+        if !has_param(params, k) {
+            return Err(ToolError.Tool(
+                name: tool,
+                message: "unknown argument `${k}` — this tool takes ${param_names(params)}",
+            ))
+        }
+    }
+    mut bound: List<dyn> = []
+    mut skipped = ""
+    for p in params {
+        match supplied.get(p.name) {
+            some(raw) => {
+                if skipped != "" {
+                    return Err(ToolError.Tool(
+                        name: tool,
+                        message: "`${p.name}` was supplied but `${skipped}` was not — arguments are positional, so a parameter with a default cannot be skipped over; send `${skipped}` too",
+                    ))
+                }
+                match coerce(p.type, raw) {
+                    Ok(v) => {
+                        bound = bound ~ [v]
+                    },
+                    Err(e) => {
+                        return Err(ToolError.Tool(name: tool, message: "argument `${p.name}`: ${e}"))
+                    },
+                }
+            },
+            none => {
+                if p.optional {
+                    // Leave the list short and let the callee fill its own default. Defaults are
+                    // trailing-only, so once one is absent every parameter after it is defaulted
+                    // too — and a later *supplied* one is the gap the check above catches.
+                    if skipped == "" {
+                        skipped = p.name
+                    }
+                } else if is_option(p.type) {
+                    // An `?T` with no default is positionally required, and an omitted optional
+                    // argument means exactly `none`. Binding it keeps the position filled.
+                    if skipped != "" {
+                        return Err(ToolError.Tool(
+                            name: tool,
+                            message: "`${p.name}` follows the skipped `${skipped}` — arguments are positional; send `${skipped}` too",
+                        ))
+                    }
+                    bound = bound ~ [none]
+                } else {
+                    return Err(ToolError.Tool(name: tool, message: "missing required argument `${p.name}`"))
+                }
+            },
+        }
+    }
+    return Ok(bound)
+}
+
+// --- The toolbox ------------------------------------------------------------------------------
+
+// One tool in a `Toolbox`, with the source it came from.
+struct Entry {
+    spec: ToolSpec
+    // The declaring source's `source_name()`, kept for the collision message.
+    origin: string
+    tool_type: string
+    // Index into the toolbox's `sources`.
+    at: int
+}
+
+fn find_entry(entries: List<Entry>, name: string): ?Entry {
+    for e in entries {
+        if e.spec.name == name {
+            return some(e)
+        }
+    }
+    return none
+}
+
+// Every tool a consumer can reach, across every source.
+//
+// **A name collision is a construction-time error naming both sources**, never a last-one-wins. A
+// silently shadowed tool is the kind of bug that shows up as a wrong answer three weeks later, and
+// the two sources involved are exactly what a reader needs to fix it.
+//
+// A value struct holding `List<dyn ToolSource>`: that makes a populated `Toolbox` `!Send`. Build it
+// per worker from whatever configuration is `Send`.
+pub struct Toolbox {
+    sources: List<dyn ToolSource> = []
+    entries: List<Entry> = []
+
+    pub fn new(): Toolbox {
+        return Toolbox {}
+    }
+
+    // The one-source toolbox — the common case.
+    pub fn of(src: dyn ToolSource): Result<Toolbox, ToolError> {
+        return Toolbox.new().with(src)
+    }
+
+    // Add a source, collision-checked. Chains: `Toolbox.of(a)?.with(b)?`.
+    pub fn with(src: dyn ToolSource): Result<Toolbox, ToolError> {
+        specs = src.specs()?
+        origin = src.source_name()
+        kind = src.tool_type()
+        at = self.sources.len()
+        mut entries = self.entries
+        for s in specs {
+            match find_entry(entries, s.name) {
+                some(clash) => {
+                    return Err(ToolError.Tool(
+                        name: s.name,
+                        message: "declared by both `${clash.origin}` and `${origin}` — a shadowed tool is a wrong answer three weeks later, so this is a construction-time error rather than a last-one-wins",
+                    ))
+                },
+                none => {},
+            }
+            entries = entries ~ [Entry { spec: s, origin: origin, tool_type: kind, at: at }]
+        }
+        return Ok(Toolbox { sources: self.sources ~ [src], entries: entries })
+    }
+
+    // What goes on the request, or over the wire. Infallible: every schema was derived (and every
+    // collision refused) when the source was added.
+    pub fn specs(): List<ToolSpec> {
+        mut out: List<ToolSpec> = []
+        for e in self.entries {
+            out = out ~ [e.spec]
+        }
+        return out
+    }
+
+    pub fn names(): List<string> {
+        mut out: List<string> = []
+        for e in self.entries {
+            out = out ~ [e.spec.name]
+        }
+        return out
+    }
+
+    pub fn len(): int {
+        return self.entries.len()
+    }
+
+    pub fn is_empty(): bool {
+        return self.entries.len() == 0
+    }
+
+    pub fn has(name: string): bool {
+        return match find_entry(self.entries, name) {
+            some(_) => true,
+            none => false,
+        }
+    }
+
+    // `gen_ai.tool.type` for one tool — `"function"` for a local `#[Tool]`, `"mcp"` for a server's.
+    pub fn tool_type(name: string): string {
+        return match find_entry(self.entries, name) {
+            some(e) => e.tool_type,
+            none => "function",
+        }
+    }
+
+    // Route one call to the source that declared it. An unknown name is an `Err` listing what the
+    // toolbox does have, which is a far better correction turn than "not found".
+    pub fn call(name: string, args: string): Result<string, ToolError> {
+        return match find_entry(self.entries, name) {
+            some(e) => self.sources[e.at].call(name, args),
+            none => Err(ToolError.Tool(
+                name: name,
+                message: "no such tool — this toolbox has ${offered(self.names())}",
+            )),
+        }
+    }
+}
+
+fn offered(names: List<string>): string {
+    if names.len() == 0 {
+        return "no tools at all"
+    }
+    return names.join(", ")
+}
+
+// --- The shapes that have no schema, as real declarations ---------------------------------------
+//
+// Deliberately **not** `#[Tool]`: they exist so the refusal path is exercised against genuinely
+// declared signatures — what `params_of` actually reports — rather than against `Type` values
+// assembled by hand. That is the stricter test: a hand-built `Type` asserts what this module
+// believes a signature means, where a real declaration asserts what the checker says it means.
+//
+// They stay at **module level**, unlike the `#[Tool]` fixtures in the `@test` block below, and the
+// difference is load-bearing rather than an oversight. A declaration lifted out of a dev tier is
+// keyed by its **bare** name, where a module-level one is keyed `tool.<name>` — so these are what
+// keep `schema_of` and `params_of` under test against a *qualified* reflection key, which is the
+// shape every tool in a consumer's module has. Nothing here is `#[Tool]`, so none of it is reachable
+// by a model, which is the property the tier exists to protect.
+
+fn refuses_bytes(blob: bytes): void {
+    return
+}
+
+fn refuses_result(r: Result<int, string>): void {
+    return
+}
+
+fn refuses_fn(f: (int) -> int): void {
+    return
+}
+
+fn refuses_dyn_trait(s: dyn ToolSource): void {
+    return
+}
+
+fn refuses_f32(x: f32): void {
+    return
+}
+
+fn refuses_fixed_width(xs: List<i32>): void {
+    return
+}
+
+fn refuses_map_key(m: Map<int, string>): void {
+    return
+}
+
+fn refuses_enum(m: Mood): void {
+    return
+}
+
+fn refuses_nested(xs: List<bytes>): void {
+    return
+}
+
+// --- Probe declarations for the nominal walk ------------------------------------------------------
+//
+// Module level, for the same reason the refusals above are: a declaration lifted out of a `@test`
+// block is keyed by its **bare** name, and the qualified key (`tool.Mood`) is the shape every type
+// in a consumer's module actually has. None of these is `#[Tool]` and none is `pub`, so nothing here
+// is reachable by a model or nameable by a consumer — they exist to be *reflected*, which needs
+// neither.
+
+// A payload-free enum, whose case names are its wire values.
+enum Mood {
+    Positive
+    Negative
+    Mixed
+}
+
+// A **backed** enum: the schema must carry the backings, not the case names.
+enum Tier: string {
+    Free = "free"
+    Paid = "paid"
+}
+
+// A **payload-carrying** enum, which the schema walk refuses separately from the parameter walk: a
+// data-carrying sum type has no one spelling every vendor's strict mode accepts.
+enum Carrier {
+    Empty
+    Text(body: string)
+}
+
+// A nested struct, one level down from `SchemaProbe`.
+struct Mention {
+    who: string
+    weight: float = 1.0
+}
+
+// One declared type carrying every shape the walk has to get right at once: a scalar, a nested
+// struct, an enum, a list of nested structs, an `?T`, and a defaulted field.
+struct SchemaProbe {
+    company: string
+    mood: Mood
+    tier: Tier
+    lead: Mention
+    mentions: List<Mention>
+    note: ?string
+    confidence: float = 0.5
+}
+
+// A type whose fields carry their own `#[Arg(help: …)]` — the type door's half of the description
+// story. Two annotated fields and one bare one, because "an unannotated field gets no `description`
+// key" is as much of the contract as the annotated ones are.
+struct Described {
+    #[Arg(help: "`billing`, `shipping`, or `other`")]
+    category: string
+    #[Arg(help: "1 (a question) to 5 (money is on fire)")]
+    severity: int
+    plain: bool
+}
+
+// Self-referential: a cycle has no finite JSON Schema without `$ref`.
+struct Cyclic {
+    label: string
+    next: ?Cyclic
+}
+
+// A struct-typed parameter, which derives a nested object schema and coerces back through
+// `construct`. It is a real declaration rather than a hand-built `Type` for the usual reason.
+fn takes_a_struct(m: Mention): string {
+    return "${m.who}@${m.weight}"
+}
+
+// An enum-typed parameter, refused at the *dispatch* layer, because nothing at run time can build an
+// enum value from JSON even though its schema derives perfectly.
+fn takes_an_enum(m: Mood): void {
+    return
+}
+
+// An enum two levels down inside a struct, so the parameter refusal is proved to walk rather than
+// to look only at the top.
+fn takes_a_struct_hiding_an_enum(p: SchemaProbe): void {
+    return
+}
+
+// One parameter of each supported declared type, so a coercion test can take its `Type` from a real
+// signature — the stricter test, because it asserts what the checker says the signature means rather
+// than what this module believes it means.
+fn types_probe(
+    i: int,
+    f: float,
+    b: bool,
+    s: string,
+    d: dyn,
+    li: List<int>,
+    si: Set<int>,
+    mi: Map<string, int>,
+    os: ?string,
+    uis: int | string,
+    uib: int | bool,
+): void {
+    return
+}
+
+@test {
+    // --- The package's own tools, for its own tests ----------------------------------------------
+    //
+    // These live **inside the dev tier**, and that is a correctness requirement rather than tidiness.
+    // `attributes_of::<Tool>()` is whole-program: a `#[Tool]` declared at module level in library
+    // code is discovered from every consuming application, and `Local` would offer it to that
+    // application's model. `Tool` is `@role(Semantic.TrustBoundary)` precisely because a tool is
+    // reachable by a model, so a library shipping its own fixtures across that boundary is a
+    // security defect, not a test-fixture nuisance. A `@test` block is stripped before lowering on
+    // any build that is not `noeta test`, so these exist only while this file's own suite runs.
+    // `examples/routing` asserts the property from the one side that can see it.
+    //
+    // `#[std.test.Skip]` is what makes a *parameterized* fixture possible: every `fn` in a top-level
+    // `@test` block is a test root, and the runner would otherwise try to call `shout()` with no
+    // argument and fail it. Skipped means "never run as a test" and nothing more — the function is
+    // still compiled, still discovered by `attributes_of`, still carries its role, and is still
+    // dispatchable through `invoke`, which is exactly what a fixture needs. The attribute is
+    // qualified inline rather than imported: a top-level `use std.test.{Skip}` would put a
+    // dev-only import in the module's shipping surface.
+    //
+    // One consequence to know when reading the tests below: a declaration lifted out of a tier
+    // block is keyed by its **bare** name (`shout`), not `tool.shout`.
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Echo a string back, uppercased")]
+    fn shout(#[Arg(help: "The text to shout")] text: string): string {
+        return text.upper()
+    }
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Add two integers", name: "add")]
+    fn add_ints(
+        #[Arg(help: "The left operand")] a: int,
+        #[Arg(help: "The right operand")] b: int = 1,
+    ): Result<int, string> {
+        if a > 1000000 {
+            return Err("`a` is unreasonably large")
+        }
+        return Ok(a + b)
+    }
+
+    #[std.test.Skip("a tool fixture for this module's suite, not a test")]
+    #[Tool(about: "Every declared parameter shape that has a schema")]
+    fn shapes(
+        flag: bool,
+        ratio: float,
+        tags: List<string>,
+        uniq: Set<int>,
+        lookup: Map<string, int>,
+        maybe: ?string,
+        anything: dyn,
+        either: int | string,
+    ): string {
+        return "${flag}/${ratio}/${tags.len()}/${uniq.len()}/${lookup.len()}/${maybe ?? "-"}/${anything}/${either}"
+    }
+
+    // A source that fails as a source rather than as a tool — the shape an MCP client takes when its
+    // server will not start. It exists so `ToolError.Source` is a variant something actually raises
+    // and `Toolbox.with` is proved to propagate it, rather than a slot reserved for a consumer.
+    //
+    // The `impl` is written **inline in the type body** rather than as a standalone
+    // `impl ToolSource for BrokenSource` block: a standalone one does not always coerce to
+    // `dyn ToolSource` at a call site outside the declaring module.
+    struct BrokenSource {
+        impl ToolSource {
+            pub fn source_name(): string {
+                return "mcp:memory"
+            }
+
+            pub fn tool_type(): string {
+                return "mcp"
+            }
+
+            pub fn specs(): Result<List<ToolSpec>, ToolError> {
+                return Err(ToolError.Source(source: "mcp:memory", code: "server_exited", message: "exit status 3"))
+            }
+
+            pub fn call(name: string, args: string): Result<string, ToolError> {
+                return Err(ToolError.Source(source: "mcp:memory", code: "closed", message: "the session ended"))
+            }
+        }
+    }
+
+    // --- Discovery and the trust-boundary role ---------------------------------------------------
+
+    fn the_tool_attribute_finds_the_functions_it_annotates(): void {
+        seen = specs_or_fail(Local.new()).map(fn(s) => s.name)
+        assert(seen.contains("shout"), "${seen}")
+        // `#[Tool(name: "add")]` overrides the function's own name.
+        assert(seen.contains("add"), "${seen}")
+        assert(!seen.contains("add_ints"), "the override replaces the function name: ${seen}")
+    }
+
+    // The model-facing name is a reflection key's last segment, and a key is qualified — so a
+    // consumer's `#[Tool] fn weather` in the module `app.tools` is offered as `weather`, not as
+    // `app.tools.weather`, which no vendor's name grammar accepts. Asserted directly on the helpers
+    // rather than only through the fixtures above: this module's own fixtures live in the dev tier
+    // and so carry *bare* keys, and a bare key makes `last_segment` an identity function that would
+    // pass whether or not it stripped anything.
+    fn a_qualified_reflection_key_shortens_to_its_last_segment(): void {
+        assert(last_segment("app.tools.weather") == "weather")
+        assert(last_segment("weather") == "weather")
+        assert(owner_of("app.tools.weather") == "app.tools")
+        assert(owner_of("weather") == "")
+    }
+
+    // What separates a method from a namespaced free function is not the dots — both have them —
+    // but whether the key minus its last segment names a declared type.
+    fn a_method_key_is_told_from_a_namespaced_function_key(): void {
+        assert(is_method_target(local_target("Toolbox.call")), "a real method on a real type")
+        assert(!is_method_target(local_target("refuses_bytes")), "a namespaced free function")
+        assert(!is_method_target("shout"), "a bare key has no owner at all")
+    }
+
+    // The line that makes "what can a model reach in this program?" a query rather than a code
+    // review. Asserted rather than merely written: an annotation that confers no role is a comment.
+    fn every_tool_is_tagged_a_trust_boundary(): void {
+        mut tagged: List<string> = []
+        for r in roles_of::<Semantic>() {
+            if r.role == Semantic.TrustBoundary {
+                tagged = tagged ~ [r.target]
+            }
+        }
+        assert(tagged.contains("shout"), "roles_of::<Semantic>() sees the tools: ${tagged}")
+        assert(tagged.contains("add_ints"), "the role rides the target, not the model-facing name: ${tagged}")
+        assert(tagged.contains("shapes"), "${tagged}")
+        // And nothing else in this module is a trust boundary.
+        assert(!tagged.contains(local_target("refuses_bytes")), "${tagged}")
+        assert(!tagged.contains("refuses_bytes"), "${tagged}")
+    }
+
+    // --- Selection -------------------------------------------------------------------------------
+
+    // The default is every `#[Tool]` in the program, and the reason is in `Local.new`'s comment: a
+    // narrower one is not expressible here, and a narrower one that guessed would hide a
+    // dependency's leak at the layer that exists to expose it.
+    fn the_default_selection_is_every_tool_in_the_program(): void {
+        assert(names_of_specs(Local.new()) == ["shout", "add", "shapes"], "${names_of_specs(Local.new())}")
+    }
+
+    // `under` matches at a **segment boundary**, and a target that *is* the namespace matches — the
+    // degenerate spelling of "this one tool, by its qualified name". That is the only form these
+    // fixtures can exercise, because a declaration lifted out of a dev tier is keyed by its bare
+    // name and so has no namespace at all; the namespaced form is asserted from a consumer in
+    // `examples/routing`, where the targets are real module paths.
+    fn under_narrows_to_a_namespace(): void {
+        assert(names_of_specs(Local.new().under("shout")) == ["shout"], "${names_of_specs(Local.new().under("shout"))}")
+        // Repeatable, and the namespaces union rather than intersect.
+        assert(names_of_specs(Local.new().under("shout").under("add_ints")) == ["shout", "add"],
+            "${names_of_specs(Local.new().under("shout").under("add_ints"))}")
+    }
+
+    // `only` and `except` speak the **model-facing** name, which is the vocabulary a reader of the
+    // line is thinking in — `add`, the `#[Tool(name:)]` override, not the function's own `add_ints`.
+    fn only_and_except_speak_the_model_facing_name(): void {
+        assert(names_of_specs(Local.new().only(["add"])) == ["add"])
+        assert(names_of_specs(Local.new().except(["add"])) == ["shout", "shapes"],
+            "${names_of_specs(Local.new().except(["add"]))}")
+        // The override is the name selection sees; the symbol is not.
+        assert(selection_error(Local.new().only(["add_ints"])).contains("`only` names `add_ints`"),
+            selection_error(Local.new().only(["add_ints"])))
+    }
+
+    // They compose, in the order they read: namespace, then keep, then drop.
+    fn the_three_selectors_compose_in_reading_order(): void {
+        chosen = Local.new().under("shout").under("add_ints").except(["shout"])
+        assert(names_of_specs(chosen) == ["add"], "${names_of_specs(chosen)}")
+    }
+
+    // **An unmatched selector is an error, not a no-op.** The failure this prevents is a selection
+    // that quietly matches nothing, which surfaces as a model that never calls anything — three
+    // layers and a day from the typo that caused it.
+    fn a_selector_that_matches_nothing_is_refused_naming_it(): void {
+        e = selection_error(Local.new().under("app.exposd"))
+        assert(e.contains("no `#[Tool]` is declared under `app.exposd`"), e)
+        assert(e.contains("shout"), "and it lists what the program does declare: ${e}")
+
+        missing = selection_error(Local.new().only(["wether"]))
+        assert(missing.contains("`only` names `wether`"), missing)
+
+        redundant = selection_error(Local.new().except(["wether"]))
+        assert(redundant.contains("`except` names `wether`"), redundant)
+        assert(redundant.contains("redundant exclusion"), redundant)
+    }
+
+    // An `except` is checked against what the namespace filter already chose, so excluding a tool
+    // that some *other* namespace declares is still a redundant exclusion and still says so.
+    fn an_except_is_checked_against_the_selection_not_the_program(): void {
+        e = selection_error(Local.new().under("shout").except(["add"]))
+        assert(e.contains("`except` names `add`"), e)
+    }
+
+    // **Selection is routing, not display.** A tool outside the selection is not callable through
+    // that `Local` — which is what stops a client that guessed a name from reaching a function the
+    // program deliberately did not expose.
+    fn a_tool_outside_the_selection_is_not_callable(): void {
+        narrow = Local.new().only(["add"])
+        assert(narrow.call("add", "{\"a\": 1, \"b\": 2}") == Ok("3"))
+        match narrow.call("shout", "{\"text\": \"hej\"}") {
+            Ok(v) => {
+                assert(false, "a tool outside the selection must not be callable, got ${v}")
+            },
+            Err(e) => {
+                assert("${e}".contains("no `#[Tool]` function is named `shout`"), "${e}")
+            },
+        }
+        // And it really is a selection rather than a broken dispatch: the same call succeeds
+        // through a `Local` that selected it.
+        assert(Local.new().call("shout", "{\"text\": \"hej\"}") == Ok("HEJ"))
+    }
+
+    // **Fixed at construction.** The MCP specification requires that a server's `tools/list` not
+    // vary per connection, and this type has no way to express one that does: the reflection index
+    // is compile-time and the selection is three immutable lists, so `specs()` is a pure function of
+    // the constructed value. Two independently built selections of the same shape are equal, and
+    // answer identically.
+    fn a_selection_is_fixed_at_construction(): void {
+        one = Local.new().under("shout").except(["shout"])
+        two = Local.new().under("shout").except(["shout"])
+        assert(one == two, "a selection is a value: ${one} vs ${two}")
+        assert(names_of_specs(one) == names_of_specs(two))
+        // Asked twice, answered the same — there is no per-call input for it to depend on.
+        assert(names_of_specs(one) == names_of_specs(one))
+    }
+
+    // --- Schema derivation -----------------------------------------------------------------------
+
+    // The exact bytes a known signature produces. `json.stringify` sorts keys, so this is stable —
+    // and an exact-string assertion is the only kind that catches a schema silently changing shape.
+    fn a_signature_derives_exactly_this_json_schema(): void {
+        derived = schema_or_fail("add_ints")
+        assert(derived
+            == "{\"additionalProperties\":false,\"properties\":{\"a\":{\"description\":\"The left operand\",\"type\":\"integer\"},\"b\":{\"description\":\"The right operand\",\"type\":\"integer\"}},\"required\":[\"a\"],\"type\":\"object\"}", derived)
+    }
+
+    // `#[Arg(help)]` is the parameter's `description`, which is where a model learns what a bare
+    // `string` is for.
+    fn arg_help_becomes_the_parameters_description(): void {
+        s = schema_or_fail("shout")
+        assert(s.contains("\"description\":\"The text to shout\""), s)
+    }
+
+    // A defaulted parameter is absent from `required`; a mandatory one is in it.
+    fn a_default_makes_a_parameter_optional(): void {
+        s = schema_or_fail("add_ints")
+        assert(s.contains("\"required\":[\"a\"]"), s)
+    }
+
+    fn every_supported_type_derives_its_schema(): void {
+        s = schema_or_fail("shapes")
+        assert(s.contains("\"flag\":{\"type\":\"boolean\"}"), s)
+        assert(s.contains("\"ratio\":{\"type\":\"number\"}"), s)
+        assert(s.contains("\"tags\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"}"), s)
+        assert(s.contains("\"uniq\":{\"items\":{\"type\":\"integer\"},\"type\":\"array\",\"uniqueItems\":true}"), s)
+        assert(s.contains("\"lookup\":{\"additionalProperties\":{\"type\":\"integer\"},\"type\":\"object\"}"), s)
+        // An `?T` is its inner schema, and is absent from `required`.
+        assert(s.contains("\"maybe\":{\"type\":\"string\"}"), s)
+        // `dyn` is declared to accept anything, so the empty schema is the honest reading.
+        assert(s.contains("\"anything\":{}"), s)
+        assert(s.contains("\"either\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}"), s)
+        assert(s.contains("\"required\":[\"flag\",\"ratio\",\"tags\",\"uniq\",\"lookup\",\"anything\",\"either\"]"), "an `?T` parameter is never required: ${s}")
+    }
+
+    // Total means total: every underivable declared type is a message naming the parameter, the
+    // type, and what to write instead — never an empty schema discovered at the first model call.
+    fn an_underivable_type_is_a_loud_message_not_an_empty_schema(): void {
+        assert(refusal("refuses_bytes").contains("`bytes` has no tool-argument encoding"))
+        assert(refusal("refuses_result").contains("`Result` parameter"))
+        assert(refusal("refuses_fn").contains("function-typed"))
+        assert(refusal("refuses_dyn_trait").contains("has no JSON representation"))
+        assert(refusal("refuses_f32").contains("f32"))
+        assert(refusal("refuses_fixed_width").contains("fixed-width"))
+        // A map has to be keyed by string, because a JSON object's keys are.
+        assert(refusal("refuses_map_key").contains("keyed by `string`"))
+        // Every message names the parameter it is about, not just the type.
+        assert(refusal("refuses_bytes").contains("parameter `blob`"), refusal("refuses_bytes"))
+        // A failure nested in a container is reported, not swallowed by the container's own schema.
+        assert(refusal("refuses_nested").contains("`bytes`"), refusal("refuses_nested"))
+    }
+
+    // --- The nominal walk ------------------------------------------------------------------------
+
+    // The exact bytes a declared *type* produces, with a nested struct, a plain enum, a backed enum,
+    // a list of nested structs, an `?T` and a defaulted field all in one. Exact rather than
+    // `contains`, because the whole claim is that the schema is **derived** from the declaration,
+    // and an exact assertion is the only kind that catches it silently changing shape.
+    //
+    // Read the interesting parts off it: `mood` is its case names, `tier` is its *backings* and not
+    // its case names, `lead` and `mentions` recurse into a second object schema (with `weight`
+    // absent from the inner `required` because it declared a default), `note` is present in
+    // `properties` and absent from `required`, and every object is closed.
+    fn a_declared_type_derives_exactly_this_json_schema(): void {
+        derived = type_schema_or_fail(local_target("SchemaProbe"))
+        assert(derived
+            == "{\"additionalProperties\":false,\"properties\":{\"company\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"},\"lead\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"mentions\":{\"items\":{\"additionalProperties\":false,\"properties\":{\"weight\":{\"type\":\"number\"},\"who\":{\"type\":\"string\"}},\"required\":[\"who\"],\"type\":\"object\"},\"type\":\"array\"},\"mood\":{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"tier\":{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}},\"required\":[\"company\",\"mood\",\"tier\",\"lead\",\"mentions\"],\"type\":\"object\"}", derived)
+    }
+
+    // The two queries are asked as a pair, and this is why: through `field_specs_of` alone an enum
+    // and a field-less struct are the same answer. A schema builder that walked fields only would
+    // have emitted an empty object for `Mood` and been silently wrong.
+    fn an_enum_is_told_from_a_fieldless_struct_by_variants_of(): void {
+        assert(field_specs_of(local_target("Mood")).len() == 0, "an enum has no fields")
+        assert(variants_of(local_target("Mood")).len() == 3, "and three variants")
+        assert(field_specs_of(local_target("Mention")).len() == 2, "a struct has fields")
+        assert(variants_of(local_target("Mention")).len() == 0, "and no variants")
+    }
+
+    // A backed enum's wire value is its backing. Emitting the case names would describe a document
+    // nothing produces.
+    fn a_backed_enum_carries_its_backings_not_its_case_names(): void {
+        s = type_schema_or_fail(local_target("Tier"))
+        assert(s == "{\"enum\":[\"free\",\"paid\"],\"type\":\"string\"}", s)
+    }
+
+    // A cycle is refused by name rather than walked until the stack runs out.
+    fn a_recursive_type_is_refused_naming_the_cycle(): void {
+        e = type_refusal(local_target("Cyclic"))
+        assert(e.contains("is recursive"), e)
+        assert(e.contains(local_target("Cyclic") ~ " → " ~ local_target("Cyclic")), "it prints the chain: ${e}")
+        assert(e.contains("$ref"), "and says what a cycle would need: ${e}")
+    }
+
+    // A name nothing declares answers both queries with nothing, which is the one honest "unknown".
+    fn a_name_nothing_declares_is_neither_a_struct_nor_an_enum(): void {
+        e = type_refusal(local_target("NoSuchType"))
+        assert(e.contains("declares neither fields nor variants"), e)
+    }
+
+    // The callable door and the type door are the same walk, so a struct-typed *parameter* and a
+    // struct-typed *field* produce byte-identical fragments. One walk, one place a bug can live.
+    fn the_parameter_door_and_the_type_door_derive_the_same_bytes(): void {
+        param = schema_or_fail(local_target("takes_a_struct"))
+        field = type_schema_or_fail(local_target("Mention"))
+        assert(param.contains(field), "the parameter schema embeds the type schema verbatim: ${param} vs ${field}")
+    }
+
+    // **A field describes itself, exactly as a parameter does.** `#[Arg(help: …)]` becomes the
+    // field's `description`, which is where a model learns that a `string` named `category` takes
+    // one of four words — the single most valuable line in a structured-output schema. A field is
+    // annotated and read through the *same* descriptor slot a parameter is: `FieldSpec.attrs` beside
+    // `ParamInfo.attrs`, both a `List<dyn>` the one `help_of` narrows.
+    fn a_field_describes_itself_exactly_as_a_parameter_does(): void {
+        s = type_schema_or_fail(local_target("Described"))
+        assert(s.contains("\"category\":{\"description\":\"`billing`, `shipping`, or `other`\",\"type\":\"string\"}"), s)
+        assert(s.contains("\"severity\":{\"description\":\"1 (a question) to 5 (money is on fire)\",\"type\":\"integer\"}"), s)
+        // An unannotated field carries no `description` key at all — an empty one would be a claim.
+        assert(s.contains("\"plain\":{\"type\":\"boolean\"}"), "a bare field stays bare: ${s}")
+    }
+
+    // An enum parameter is refused for the missing runtime *constructor*, not for a missing schema —
+    // and the message says which, because the two want different fixes.
+    fn an_enum_parameter_is_refused_for_the_constructor_not_the_schema(): void {
+        e = refusal("takes_an_enum")
+        assert(e.contains("nothing at run time can build an enum value"), e)
+        assert(e.contains("schema* derives fine"), "it says the schema is not the problem: ${e}")
+        // And the schema really does derive, which is what makes that claim checkable rather than
+        // an apology.
+        assert(type_schema_or_fail(local_target("Mood")) == "{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"}")
+    }
+
+    // The parameter refusal walks: an enum buried two levels down is caught at the parameter, not
+    // discovered at the first model call.
+    fn an_enum_nested_inside_a_struct_parameter_is_caught_at_the_parameter(): void {
+        e = refusal("takes_a_struct_hiding_an_enum")
+        assert(e.contains("SchemaProbe.mood"), "it names the path to the enum: ${e}")
+        assert(e.contains("build an enum value"), e)
+    }
+
+    // A payload-carrying enum is refused by the *schema*, separately from the parameter refusal
+    // above: a data-carrying sum type has no one spelling every vendor's strict mode accepts.
+    fn a_data_carrying_enum_has_no_schema(): void {
+        e = type_refusal(local_target("Carrier"))
+        assert(e.contains("carries a payload"), e)
+        assert(e.contains("Carrier.Text"), "it names the offending variant: ${e}")
+    }
+
+    // The two arms of `json_schema` no *declared* signature can reach: `void` is not a parameter
+    // type a program can write, and an `f64` only appears in container position where `float` is
+    // what a plain parameter declares. Constructing a `Type` by hand is what makes the total
+    // function testable as a total function.
+    fn the_arms_no_declaration_can_reach_still_refuse(): void {
+        assert(match json_schema(Type.Unit) {
+            Ok(s) => false,
+            Err(e) => e.contains("`void` is not a value a model can send"),
+        }, "${json_schema(Type.Unit)}")
+        assert(match json_schema(Type.F64) {
+            Ok(s) => false,
+            Err(e) => e.contains("f64"),
+        }, "${json_schema(Type.F64)}")
+        // And a constructed `Type` is the same value `type_of` reports, so reading one off a
+        // declaration and building one are interchangeable.
+        assert(type_of(5) == Type.Int, "${type_of(5)}")
+        assert(probe_type("li") == Type.List(Type.Int), "${probe_type("li")}")
+    }
+
+    // --- Coercion ----------------------------------------------------------------------------------
+
+    fn scalars_coerce_from_the_neighboring_json_type(): void {
+        // A model that sends `"5"` for an integer meant 5, and refusing costs a round trip.
+        assert(coerced("i", "5") == "5")
+        assert(coerced("i", "2.0") == "2", "a whole JSON number is an integer")
+        assert(coerced("f", "3") == "3.0")
+        assert(coerced("b", "\"true\"") == "true")
+        assert(coerced("s", "5") == "5")
+        assert(coerced("d", "{\"anything\": 1}") == "{\"anything\": 1}")
+    }
+
+    // Lenient in one direction only: a conversion that loses information is refused.
+    fn a_lossy_coercion_is_refused(): void {
+        assert(coercion_error("i", "2.5").contains("fractional"))
+        assert(coercion_error("i", "\"seven\"").contains("expected an integer"))
+        assert(coercion_error("b", "\"yes\"").contains("expected a boolean"))
+        // An object is not prose, so it does not become a string parameter's value.
+        assert(coercion_error("s", "{\"a\":1}").contains("expected a string"))
+    }
+
+    fn containers_coerce_element_wise(): void {
+        assert(coerced("li", "[1, \"2\", 3.0]") == "[1, 2, 3]")
+        assert(coerced("mi", "{\"a\": 1}") == "{\"a\": 1}")
+        assert(coerced("si", "[1, 1, 2]") == "{1, 2}", coerced("si", "[1, 1, 2]"))
+        // The path names the offending element rather than the whole array.
+        assert(coercion_error("li", "[1, \"x\"]").contains("[1]"))
+        assert(coercion_error("li", "5").contains("expected an array"))
+        assert(coercion_error("mi", "5").contains("expected an object"))
+        assert(coercion_error("mi", "{\"a\": \"x\"}").contains(".a"))
+    }
+
+    fn an_option_takes_null_as_none(): void {
+        assert(coerced("os", "null") == "none")
+        assert(coerced("os", "\"hi\"") == "some(hi)")
+        // `null` for a non-optional parameter is a missing argument wearing a value's clothes.
+        assert(coercion_error("i", "null").contains("got null"))
+    }
+
+    fn a_union_takes_the_first_member_that_accepts(): void {
+        assert(coerced("uis", "7") == "7")
+        assert(coerced("uis", "\"seven\"") == "seven")
+        assert(coercion_error("uib", "{}").contains("matches no member"))
+    }
+
+    // A JSON object becomes a real struct value, with a defaulted field filled by the declaration.
+    //
+    // The `Mention {who: "ada", weight: 1.0}` rendering rather than a `{"who": …}` map rendering is
+    // the whole assertion: `construct` alone would have stored the raw map and produced a value that
+    // aborts at the first field read.
+    fn a_struct_parameter_is_built_from_its_json_object(): void {
+        target = local_target("takes_a_struct")
+        assert(coerced_param(target, "m", "{\"who\": \"ada\"}") == "Mention {who: \"ada\", weight: 1.0}", coerced_param(target, "m", "{\"who\": \"ada\"}"))
+        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"weight\": 2}") == "Mention {who: \"ada\", weight: 2.0}", "a neighboring JSON type coerces inside a struct too")
+    }
+
+    // The closed schema is enforced on the way in, exactly as it is for a callable's arguments: a
+    // key no field declares is refused rather than dropped.
+    fn a_struct_parameter_refuses_what_its_schema_closed(): void {
+        target = local_target("takes_a_struct")
+        assert(coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}").contains("no field `nope`"), coerced_param(target, "m", "{\"who\": \"ada\", \"nope\": 1}"))
+        assert(coerced_param(target, "m", "{}").contains("requires the field `who`"), coerced_param(target, "m", "{}"))
+        assert(coerced_param(target, "m", "{\"who\": {\"a\": 1}}").contains("Mention.who"), "a field failure names its path: ${coerced_param(target, "m", "{\"who\": {\"a\": 1}}")}")
+        assert(coerced_param(target, "m", "5").contains("expected an object"))
+    }
+
+    // The real dispatch, end to end: a struct-typed parameter reaches the function as a struct.
+    fn a_struct_argument_reaches_the_function_as_a_struct(): void {
+        // `takes_a_struct` is not a `#[Tool]`, so it is called through the same coercion + `invoke`
+        // pair the toolbox uses rather than through the toolbox.
+        target = local_target("takes_a_struct")
+        built = coerce(params_of(target)[0].type, parsed("{\"who\": \"ada\", \"weight\": 3}"))
+        match built {
+            Ok(v) => {
+                assert(invoke(target, [v]) == Ok("ada@3.0"), "${invoke(target, [v])}")
+            },
+            Err(e) => {
+                assert(false, "coercion failed: ${e}")
+            },
+        }
+    }
+
+    // --- Calling ------------------------------------------------------------------------------------
+
+    // The whole point, in one assertion: a JSON argument blob reaches the real Noeta function and
+    // its return value comes back.
+    fn a_tool_call_reaches_the_function_and_returns_its_value(): void {
+        assert(called("shout", "{\"text\": \"hej\"}") == Ok("HEJ"))
+        assert(called("add", "{\"a\": 2, \"b\": 3}") == Ok("5"))
+        // A defaulted parameter left off is filled by the callee, not by this package.
+        assert(called("add", "{\"a\": 2}") == Ok("3"))
+    }
+
+    // A tool declared `Result<T, E>` is unwrapped: an `Err` is a failed turn carrying its message.
+    fn a_tool_returning_err_is_a_failed_turn(): void {
+        match called("add", "{\"a\": 9999999}") {
+            Ok(v) => {
+                assert(false, "an Err return is not an answer, got ${v}")
+            },
+            Err(e) => {
+                assert("${e}".contains("unreasonably large"), "${e}")
+            },
+        }
+    }
+
+    // Every one of these is a recoverable turn rather than an abort — which is the property that
+    // lets a consumer survive a model that guessed.
+    fn a_bad_call_is_an_error_not_an_abort(): void {
+        assert(call_error("nope", "{}").contains("no such tool"))
+        assert(call_error("shout", "{}").contains("missing required argument `text`"))
+        assert(call_error("shout", "{\"text\": \"a\", \"volume\": 11}").contains("unknown argument `volume`"))
+        assert(call_error("shout", "{oops").contains("invalid JSON"))
+        // A wrong-typed argument is caught here and never reaches the function body — `invoke`
+        // checks a callable's name and arity, not its argument types, so a string handed to an
+        // `int` parameter would abort *inside* the callee and take the process with it.
+        assert(call_error("add", "{\"a\": \"two\"}").contains("expected an integer"))
+    }
+
+    // A malformed argument blob names the document rather than complaining bare, which is what makes
+    // a parser message readable in a transcript full of other JSON.
+    fn a_malformed_argument_blob_names_the_tool(): void {
+        e = call_error("shout", "{oops")
+        assert(e.contains("tool `shout` arguments"), e)
+    }
+
+    // `invoke` takes a positional list and nothing else, so a skipped middle parameter is not
+    // expressible. Named rather than guessed: reflection does not expose a parameter's default.
+    fn a_missing_required_argument_is_named(): void {
+        e = call_error("shapes", "{\"flag\": true}")
+        assert(e.contains("missing required argument `ratio`"), e)
+    }
+
+    // --- The toolbox -------------------------------------------------------------------------------
+
+    fn a_toolbox_offers_every_tool_of_every_source(): void {
+        box = toolbox_or_fail()
+        assert(box.len() == 3, "${box.names()}")
+        assert(box.has("shout"))
+        assert(box.has("add"))
+        assert(!box.has("add_ints"))
+        assert(box.tool_type("shout") == "function")
+        assert(Toolbox.new().is_empty())
+        assert(box.specs().len() == box.len())
+    }
+
+    // Not last-one-wins. The message names both sources, because those are what a reader needs.
+    fn a_name_collision_names_both_sources(): void {
+        // `toolbox_or_fail()` rather than `?`: this function returns `void`, so a `?` would
+        // early-return on a *construction* failure and the test would pass having asserted nothing.
+        match toolbox_or_fail().with(Local.new()) {
+            Ok(_) => {
+                assert(false, "the same source twice is a collision")
+            },
+            Err(e) => {
+                assert("${e}".contains("declared by both `local` and `local`"), "${e}")
+            },
+        }
+    }
+
+    // Two sources whose selections do not overlap compose without a collision — which is the whole
+    // reason selection exists: an agent and a protocol server in one program, each with its own set.
+    fn two_disjoint_selections_compose_without_colliding(): void {
+        match Toolbox.of(Local.new().only(["shout"])) {
+            Ok(base) => {
+                match base.with(Local.new().only(["add"])) {
+                    Ok(both) => {
+                        assert(both.names() == ["shout", "add"], "${both.names()}")
+                    },
+                    Err(e) => {
+                        assert(false, "disjoint selections must compose: ${e}")
+                    },
+                }
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    fn an_unknown_tool_lists_what_the_toolbox_does_have(): void {
+        box = toolbox_or_fail()
+        match box.call("teleport", "{}") {
+            Ok(_) => {
+                assert(false, "there is no teleport tool")
+            },
+            Err(e) => {
+                assert("${e}".contains("no such tool"), "${e}")
+                assert("${e}".contains("shout"), "the message lists the real ones: ${e}")
+            },
+        }
+    }
+
+    // A source that fails *as a source* keeps its own code and its own name all the way through the
+    // toolbox — it is not flattened into a tool failure. That distinction is what lets a consumer
+    // tell "the model called something that broke" apart from "the thing tools arrive through is
+    // down", which want different responses.
+    fn a_source_failure_keeps_its_code_and_its_name(): void {
+        match Toolbox.of(BrokenSource {}) {
+            Ok(_) => {
+                assert(false, "a source that cannot list its tools must not build a toolbox")
+            },
+            Err(e) => {
+                assert(e == ToolError.Source(source: "mcp:memory", code: "server_exited", message: "exit status 3"),
+                    "the variant survives the seam: ${e}")
+                assert("${e}".contains("tool source `mcp:memory` failed (server_exited)"), "${e}")
+            },
+        }
+    }
+}
+
+// --- Test helpers ---------------------------------------------------------------------------------
+//
+// Unwrap-or-fail, kept out of the `@test` block because a `match` arm cannot both fail an assertion
+// and produce a value — so the unwrapping lives here instead of being repeated per test, and because
+// every `fn` in a top-level `@test` block is a test root the runner would try to call with no
+// arguments.
+
+// A reflection key for a declaration at **module level** in this module. Reflection keys are
+// qualified, so this module's own `refuses_bytes` is keyed `tool.refuses_bytes` and nothing finds a
+// bare `refuses_bytes`.
+//
+// **`tool.`, not `para.tool.`** — a module's path is the *importing* program's prefix plus the
+// file's path inside the package, and the program importing this file while this suite runs is this
+// package itself. A consumer keying us `para = [{ package = "para/tool" }]` derives `para.tool`, but
+// that prefix is the consumer's and no build here ever produces it — so a test hard-coding it would
+// assert against a program that does not exist.
+//
+// Not for the `#[Tool]` fixtures in the `@test` block: a declaration lifted out of a dev tier is
+// keyed by its bare name, because the namespace qualifier is applied to a module's top-level
+// declarations before the tier block is inlined. Those are addressed as `"shout"` and friends.
+fn local_target(name: string): string {
+    return "tool." ~ name
+}
+
+fn specs_or_fail(src: Local): List<ToolSpec> {
+    match src.specs() {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "specs failed: ${e}")
+        },
+    }
+    return []
+}
+
+fn names_of_specs(src: Local): List<string> {
+    return specs_or_fail(src).map(fn(s) => s.name)
+}
+
+// The refusal a selection produces, or a loud failure if it produced a tool list instead.
+fn selection_error(src: Local): string {
+    match src.specs() {
+        Ok(s) => {
+            assert(false, "this selection must not resolve, got ${s.map(fn(one) => one.name)}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+fn toolbox_or_fail(): Toolbox {
+    match Toolbox.of(Local.new()) {
+        Ok(b) => {
+            return b
+        },
+        Err(e) => {
+            assert(false, "toolbox failed: ${e}")
+        },
+    }
+    return Toolbox.new()
+}
+
+fn schema_or_fail(target: string): string {
+    match schema_of(target) {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "schema failed: ${e}")
+        },
+    }
+    return ""
+}
+
+// The schema a declared **type** produces, or a loud failure. The type door's twin of
+// `schema_or_fail`, and it takes a fully qualified reflection identity because that is what
+// `field_specs_of(name)` keys on.
+fn type_schema_or_fail(target: string): string {
+    match schema_for(target) {
+        Ok(s) => {
+            return s
+        },
+        Err(e) => {
+            assert(false, "type schema failed for `${target}`: ${e}")
+        },
+    }
+    return ""
+}
+
+// The refusal a declared type produces, or a loud failure if it produced a schema instead.
+fn type_refusal(target: string): string {
+    match schema_for(target) {
+        Ok(s) => {
+            assert(false, "`${target}` must not derive a schema, got ${s}")
+        },
+        Err(e) => {
+            return e
+        },
+    }
+    return ""
+}
+
+// Coerce a JSON fragment to a declared type read off a real parameter, rendered for assertion.
+fn coerced_param(target: string, param: string, fragment: string): string {
+    for p in params_of(target) {
+        if p.name == param {
+            return match coerce(p.type, parsed(fragment)) {
+                Ok(c) => "${c}",
+                Err(e) => "ERR ${e}",
+            }
+        }
+    }
+    assert(false, "no parameter `${param}` on `${target}`")
+    return ""
+}
+
+// The refusal a declared signature produces, or a loud failure if it produced a schema instead.
+fn refusal(name: string): string {
+    target = local_target(name)
+    match schema_of(target) {
+        Ok(s) => {
+            assert(false, "`${target}` must not derive a schema, got ${s}")
+        },
+        Err(e) => {
+            return e
+        },
+    }
+    return ""
+}
+
+// One `types_probe` parameter's **declared** type, read back off `params_of` — the same value the
+// schema and coercion paths see in production.
+fn probe_type(param: string): Type {
+    params = params_of(local_target("types_probe"))
+    for p in params {
+        if p.name == param {
+            return p.type
+        }
+    }
+    assert(false, "no parameter `${param}` on `types_probe`")
+    return params[0].type
+}
+
+// Coerce a JSON fragment to a `types_probe` parameter's declared type, rendered for assertion.
+fn coerced(param: string, fragment: string): string {
+    match coerce(probe_type(param), parsed(fragment)) {
+        Ok(c) => {
+            return "${c}"
+        },
+        Err(e) => {
+            assert(false, "coercion failed: ${e}")
+        },
+    }
+    return ""
+}
+
+fn coercion_error(param: string, fragment: string): string {
+    match coerce(probe_type(param), parsed(fragment)) {
+        Ok(c) => {
+            assert(false, "`${fragment}` must not coerce to `${param}`'s type, got ${c}")
+        },
+        Err(e) => {
+            return e
+        },
+    }
+    return ""
+}
+
+fn parsed(fragment: string): dyn {
+    return match parse_value(fragment, "test fragment") {
+        Ok(x) => x,
+        Err(e) => "PARSE FAILED: ${e}",
+    }
+}
+
+fn called(name: string, args: string): Result<string, ToolError> {
+    return toolbox_or_fail().call(name, args)
+}
+
+fn call_error(name: string, args: string): string {
+    match called(name, args) {
+        Ok(v) => {
+            assert(false, "`${name}(${args})` must not succeed, got ${v}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
