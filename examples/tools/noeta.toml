@@ -1,0 +1,11 @@
+[package]
+name = "local/tools"
+version = "0.1.0"
+# The import root this example's own modules derive under. It is also what `boundary.declared_outside`
+# is handed below: "everything under `app` is mine, and anything else came from a dependency".
+root = "app"
+
+[dependencies]
+# The scope (array) form: it is what makes `para.*` an import root, so `use para.tool` and
+# `use para.tool.boundary` both resolve.
+para = [{ path = "../..", package = "para/tool" }]

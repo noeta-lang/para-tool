@@ -1,0 +1,32 @@
+// The tools an operator console may call over a wire. These are `#[Tool]` for the same reason the
+// assistant's are — a schema derived from a signature, arguments coerced, dispatch by name — and
+// they are emphatically **not** for a language model.
+//
+// Nothing about the declarations says so. What says so is `main.noe` handing the model a selection
+// that does not include this namespace. That is the whole point of the module boundary being the
+// selector: the fact a reviewer needs is visible in the file layout rather than in a registry.
+use para.tool.{Arg, Tool}
+
+#[Tool(about: "Restart a worker by id")]
+pub fn restart_worker(
+    #[Arg(help: "The worker's id, e.g. `w-17`")] id: string,
+): Result<string, string> {
+    if !id.starts_with("w-") {
+        return Err("`${id}` is not a worker id")
+    }
+    return Ok("restarted ${id}")
+}
+
+#[Tool(about: "Purge the response cache")]
+pub fn purge_cache(
+    #[Arg(help: "Purge everything rather than only expired entries")] everything: bool = false,
+): string {
+    return if everything then "purged the whole cache" else "purged expired entries"
+}
+
+// The one an operator may run and nobody else should — it is here to make the `except` case
+// concrete rather than hypothetical.
+#[Tool(about: "Drop every row in the staging database")]
+pub fn wipe_staging(): string {
+    return "staging wiped"
+}

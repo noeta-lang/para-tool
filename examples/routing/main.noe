@@ -1,0 +1,200 @@
+// Two consumers, one program, different tool sets — what `Local`'s selection is for.
+//
+// A program with a single consumer can hand it every `#[Tool]` it declares and be right. A program
+// with two cannot. Here an assistant talks to a language model and an operator console answers a
+// wire, and the operator's tools are not things a model should be able to reach. Without selection
+// both would register the identical full set, and `wipe_staging` would be in the model's vocabulary
+// because it happened to be annotated.
+//
+// **The namespace is the selector.** A reflection target is already fully qualified
+// (`app.ops.wipe_staging`), and the model-facing name is already its last segment, so the module
+// path is structure the compiler tracks and keeps correct across a rename or a move. The fact a
+// reviewer needs — which functions the model can reach — is then visible in the file layout instead
+// of in a registry somewhere else in the program.
+//
+//     noeta run  main.noe     # the two vocabularies, and what each can call
+//     noeta test main.noe     # the assertions
+use std.{io, os}
+use para.tool
+use para.tool.boundary
+use para.tool.{Local, Toolbox}
+use app.assistant
+use app.ops
+
+// --- The two selections ---------------------------------------------------------------------------
+
+// What the model gets: the assistant's namespace, and nothing else. Fixed here, at construction —
+// not evaluated per request, which is both what the MCP specification requires of a server's
+// `tools/list` and what makes this line reviewable.
+fn for_the_model(): Local {
+    return Local.new().under("app.assistant")
+}
+
+// What the operator console gets. `wipe_staging` is excluded by name: it is the exception a whole
+// namespace cannot express, and naming it here is a line a reviewer can see, unlike its absence
+// from a list built somewhere else.
+fn for_the_operator(): Local {
+    return Local.new().under("app.ops").except(["wipe_staging"])
+}
+
+fn names(src: Local): List<string> {
+    return match src.specs() {
+        Ok(specs) => specs.map(fn(s) => s.name),
+        Err(e) => ["error: ${e}"],
+    }
+}
+
+fn demo(): int {
+    io.outln("the model may call:    ${names(for_the_model())}")
+    io.outln("the operator may call: ${names(for_the_operator())}")
+    io.outln("every #[Tool] here:    ${boundary.crossings()}")
+    io.outln("")
+    io.outln("model    -> weather:       ${answer(for_the_model(), "weather", "{\"city\": \"Lund\"}")}")
+    io.outln("model    -> wipe_staging:  ${answer(for_the_model(), "wipe_staging", "{}")}")
+    io.outln("operator -> restart_worker: ${answer(for_the_operator(), "restart_worker", "{\"id\": \"w-17\"}")}")
+    io.outln("operator -> wipe_staging:  ${answer(for_the_operator(), "wipe_staging", "{}")}")
+    return 0
+}
+
+fn answer(src: Local, name: string, args: string): string {
+    return match src.call(name, args) {
+        Ok(v) => v,
+        Err(e) => "${e}",
+    }
+}
+
+os.exit(demo())
+
+@test {
+    // The headline. Two selections over one program, each holding exactly its own namespace.
+    fn each_consumer_gets_its_own_vocabulary(): void {
+        assert(names(for_the_model()) == ["weather", "distance_km", "describe_trip"],
+            "${names(for_the_model())}")
+        assert(names(for_the_operator()) == ["restart_worker", "purge_cache"],
+            "`wipe_staging` is excluded by name: ${names(for_the_operator())}")
+        // And the default really would have handed each of them everything, which is the bug the
+        // two selections above exist to avoid.
+        assert(names(Local.new()).len() == 6, "${names(Local.new())}")
+    }
+
+    // **Selection is routing, not display.** A tool outside the selection is not callable through
+    // it — which is what stops a client that guessed a name from reaching a function this program
+    // deliberately did not expose to it.
+    fn a_tool_outside_a_selection_cannot_be_called_through_it(): void {
+        assert(for_the_model().call("weather", "{\"city\": \"Lund\"}") == Ok("18°C and clear in Lund"))
+        assert(refusal(for_the_model(), "wipe_staging", "{}").contains("no `#[Tool]` function is named `wipe_staging`"),
+            refusal(for_the_model(), "wipe_staging", "{}"))
+        assert(refusal(for_the_model(), "restart_worker", "{\"id\": \"w-17\"}").contains("no `#[Tool]` function is named"))
+
+        // The operator's set is a different one, and the exclusion holds from that side too.
+        assert(for_the_operator().call("restart_worker", "{\"id\": \"w-17\"}") == Ok("restarted w-17"))
+        assert(refusal(for_the_operator(), "wipe_staging", "{}").contains("no `#[Tool]` function is named `wipe_staging`"))
+        // The function is perfectly callable — it is this *selection* that does not offer it.
+        assert(Local.new().call("wipe_staging", "{}") == Ok("staging wiped"))
+    }
+
+    // `under` matches at a **segment boundary**, so a namespace that merely shares a prefix selects
+    // nothing — and selecting nothing is an error rather than an empty set.
+    fn a_namespace_prefix_is_not_a_string_prefix(): void {
+        e = selection_refusal(Local.new().under("app.assist"))
+        assert(e.contains("no `#[Tool]` is declared under `app.assist`"), e)
+        assert(e.contains("app.assistant.weather"), "and it lists what does exist: ${e}")
+    }
+
+    // A typo'd selector is an error, not a silently empty tool set. This is the failure mode worth
+    // paying for: a server whose `tools/list` came back empty because of one wrong character looks
+    // exactly like a model that decided not to call anything.
+    fn a_selector_that_matches_nothing_is_refused(): void {
+        assert(selection_refusal(Local.new().under("app.ops").except(["wipe_stagng"]))
+            .contains("`except` names `wipe_stagng`"))
+        assert(selection_refusal(Local.new().under("app.ops").only(["weather"]))
+            .contains("`only` names `weather`"), "a name from another namespace selects nothing here")
+    }
+
+    // Two selections that do not overlap compose into one toolbox without colliding — an assistant
+    // and an operator console served by the same process.
+    fn two_selections_compose_into_one_toolbox(): void {
+        match Toolbox.of(for_the_model()) {
+            Ok(base) => {
+                match base.with(for_the_operator()) {
+                    Ok(both) => {
+                        assert(both.names() == ["weather", "distance_km", "describe_trip", "restart_worker", "purge_cache"],
+                            "${both.names()}")
+                        assert(!both.has("wipe_staging"), "the exclusion survives composition")
+                    },
+                    Err(e) => {
+                        assert(false, "disjoint selections must compose: ${e}")
+                    },
+                }
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // Overlapping selections are a collision naming both sources, not a last-one-wins — the same
+    // rule that protects a program from two sources claiming one name.
+    fn overlapping_selections_collide_rather_than_shadow(): void {
+        match Toolbox.of(for_the_model()) {
+            Ok(base) => {
+                match base.with(Local.new().only(["weather"])) {
+                    Ok(_) => {
+                        assert(false, "two sources offering `weather` is a collision")
+                    },
+                    Err(e) => {
+                        assert("${e}".contains("declared by both"), "${e}")
+                        assert("${e}".contains("weather"), "${e}")
+                    },
+                }
+            },
+            Err(e) => {
+                assert(false, "${e}")
+            },
+        }
+    }
+
+    // **A dependency's fixtures must not reach this program.** This is the one side the property is
+    // visible from: a dev tier is active for the entry file alone, so `para/tool`'s own suite cannot
+    // see its fixtures escaping, and a consumer can.
+    //
+    // Asserted through `boundary.declared_outside` rather than against an expected list, because
+    // this door names the offender — the first segment of a returned target says which package to
+    // file against — and because it goes on failing usefully as this example grows tools of its own.
+    fn no_dependency_declares_a_tool_in_this_program(): void {
+        leaked = boundary.declared_outside(["app"])
+        assert(leaked == [], "a dependency is offering tools to this program: ${leaked}")
+        // Every `#[Tool]` in the program is one this example declared, and the count is exact so a
+        // new one from anywhere has to be accounted for here.
+        assert(boundary.crossings().len() == 6, "${boundary.crossings()}")
+        assert(boundary.crossings() == boundary.declared_outside([]),
+            "vouching for nothing returns everything, which is the honest reading")
+    }
+}
+
+// Unwrap-or-fail helpers, out here because a `match` arm cannot both fail an assertion and produce
+// a value, and because every `fn` in a top-level `@test` block is a test root.
+
+fn refusal(src: Local, name: string, args: string): string {
+    match src.call(name, args) {
+        Ok(v) => {
+            assert(false, "`${name}` must not be callable through this selection, got ${v}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}
+
+fn selection_refusal(src: Local): string {
+    match src.specs() {
+        Ok(specs) => {
+            assert(false, "this selection must not resolve, got ${specs.map(fn(s) => s.name)}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}

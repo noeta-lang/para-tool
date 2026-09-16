@@ -1,0 +1,223 @@
+// Tools from a signature, with `para.tool` — the whole of the package in one file.
+//
+// Three things this example exists to show:
+//
+//   * **The function signature is the tool spec.** Annotate an ordinary Noeta function with
+//     `#[Tool]` and the package does the rest: it finds the function by whole-program reflection,
+//     derives its JSON Schema from the declared parameter types, coerces a caller's arguments, and
+//     calls it by name. There is no tool-definition DSL, and there is nothing to keep in sync.
+//   * **Tools are a trust boundary, and the program can be asked about it.** `#[Tool]` carries
+//     `@role(Semantic.TrustBoundary)`, so "which functions here can a language model reach?" is
+//     `roles_of::<Semantic>()` — a query, not a code review.
+//   * **A failing tool is a turn, not an outage.** A bad name, a missing argument, an argument of
+//     the wrong type, and a tool that returns `Err` are all recoverable messages naming what went
+//     wrong, because the caller is usually a model that can be told and asked to try again.
+//
+//     noeta run  main.noe     # the tools, their schemas, and a few calls
+//     noeta test main.noe     # the assertions
+use std.{io, os}
+use para.tool
+use para.tool.boundary
+use para.tool.{Arg, Local, Tool, Toolbox}
+
+// --- The tools ------------------------------------------------------------------------------------
+//
+// Ordinary functions. No registration, no schema, no wrapper — `#[Tool]` and a `#[Arg(help)]` on
+// each parameter is the whole of it. The `help` text matters more than it looks: it becomes the
+// parameter's `description` in the derived schema, and it is the only place a caller learns what a
+// bare `string` is actually for.
+
+#[Tool(about: "Current weather for a city")]
+fn weather(
+    #[Arg(help: "City name, e.g. 'Malmö'")] city: string,
+    #[Arg(help: "`metric` for °C or `imperial` for °F")] units: string = "metric",
+): Result<string, string> {
+    if city == "" {
+        return Err("a city name is required")
+    }
+    return Ok(if units == "imperial" then "64°F and clear in ${city}" else "18°C and clear in ${city}")
+}
+
+// A tool that can fail, so the recovery path is a real one. `Err` is not an outage: it comes back
+// carrying this message, and a model gets to try something else — which is the behavior that makes
+// agents recover instead of stopping.
+#[Tool(about: "Road distance in kilometers between two Swedish cities")]
+fn distance_km(
+    #[Arg(help: "The city to start from")] from: string,
+    #[Arg(help: "The city to travel to")] to: string,
+): Result<int, string> {
+    roads = {"Malmö|Lund": 18, "Lund|Malmö": 18, "Malmö|Göteborg": 273, "Göteborg|Malmö": 273}
+    return match roads.get("${from}|${to}") {
+        some(km) => Ok(km),
+        none => Err("no road distance on file for ${from} to ${to}"),
+    }
+}
+
+// --- Using them -----------------------------------------------------------------------------------
+
+// A toolbox is the whole vocabulary a consumer can reach, across every source. Building one derives
+// every schema and checks every name against what is already there, so a collision is a
+// construction-time error naming both sources rather than a last-one-wins.
+fn box_or_message(): Result<Toolbox, string> {
+    return match Toolbox.of(Local.new()) {
+        Ok(b) => Ok(b),
+        Err(e) => Err("${e}"),
+    }
+}
+
+// What a caller is actually told about a tool. Worth printing once: it is the contract, and it was
+// derived from the signature rather than written twice.
+fn schema_of_the_weather_tool(): string {
+    return match Local.new().specs() {
+        Ok(specs) => spec_named(specs, "weather"),
+        Err(e) => "error: ${e}",
+    }
+}
+
+fn spec_named(specs: List<tool.ToolSpec>, name: string): string {
+    for s in specs {
+        if s.name == name {
+            return s.parameters
+        }
+    }
+    return "no tool named ${name}"
+}
+
+fn demo(): int {
+    match box_or_message() {
+        Ok(box) => {
+            io.outln("tools: ${box.names()}")
+            io.outln("weather schema: ${schema_of_the_weather_tool()}")
+            io.outln("weather(Lund, imperial) -> ${render(box.call("weather", "{\"city\": \"Lund\", \"units\": \"imperial\"}"))}")
+            io.outln("distance_km(Malmö, Lund) -> ${render(box.call("distance_km", "{\"from\": \"Malmö\", \"to\": \"Lund\"}"))}")
+            io.outln("distance_km(Malmö, Kiruna) -> ${render(box.call("distance_km", "{\"from\": \"Malmö\", \"to\": \"Kiruna\"}"))}")
+            io.outln("teleport(...) -> ${render(box.call("teleport", "{}"))}")
+        },
+        Err(e) => {
+            io.outln("error: ${e}")
+            return 1
+        },
+    }
+    return 0
+}
+
+fn render(r: Result<string, tool.ToolError>): string {
+    return match r {
+        Ok(v) => v,
+        Err(e) => "${e}",
+    }
+}
+
+// **`os.exit(...)` rather than a bare call.** A file's top-level statements are the *shared setup*
+// every `@test` in it runs on — once per test, in a fresh isolate — so a bare entry point would make
+// every assertion below pay for a full run first. `os.exit` is declared `never`, and the runner drops
+// a statement that cannot finish, argument and all.
+os.exit(demo())
+
+@test {
+    // The exact JSON Schema `weather`'s signature produces. An exact-string assertion is the only
+    // kind that catches a schema silently changing shape — and this one is derived from the
+    // declaration a few lines up, so it cannot drift from it.
+    fn the_signature_is_the_schema(): void {
+        derived = schema_of_the_weather_tool()
+        assert(derived == "{\"additionalProperties\":false,\"properties\":{\"city\":{\"description\":\"City name, e.g. 'Malmö'\",\"type\":\"string\"},\"units\":{\"description\":\"`metric` for °C or `imperial` for °F\",\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}",
+            derived)
+    }
+
+    // A tool is called by its model-facing name with a raw JSON blob, and its return value comes
+    // back. A defaulted parameter left out is filled by the callee.
+    fn a_tool_call_reaches_the_function_and_returns_its_value(): void {
+        box = box_or_fail()
+        assert(box.call("weather", "{\"city\": \"Lund\", \"units\": \"imperial\"}") == Ok("64°F and clear in Lund"))
+        assert(box.call("weather", "{\"city\": \"Lund\"}") == Ok("18°C and clear in Lund"))
+        // An `int` return renders as its own text, so a caller reads `18` rather than a Noeta value.
+        assert(box.call("distance_km", "{\"from\": \"Malmö\", \"to\": \"Lund\"}") == Ok("18"))
+    }
+
+    // Every one of these is a recoverable message rather than a crashed process, which is the
+    // property that lets a caller survive a model that guessed.
+    fn a_bad_call_is_a_message_not_a_crash(): void {
+        box = box_or_fail()
+        assert(failure(box, "teleport", "{}").contains("no such tool"))
+        assert(failure(box, "teleport", "{}").contains("weather"), "and it lists the real ones")
+        assert(failure(box, "weather", "{}").contains("missing required argument `city`"))
+        assert(failure(box, "weather", "{\"city\": \"Lund\", \"mood\": \"sunny\"}").contains("unknown argument `mood`"))
+        assert(failure(box, "distance_km", "{oops").contains("invalid JSON"))
+        // A tool that returns `Err` is a failed turn carrying its own message.
+        assert(failure(box, "distance_km", "{\"from\": \"Malmö\", \"to\": \"Kiruna\"}").contains("no road distance on file"))
+    }
+
+    // The line that makes tool calling reviewable. `#[Tool]` carries
+    // `@role(Semantic.TrustBoundary)`, so the set of model-reachable functions is a query — the
+    // same index `noeta mcp` serves to an editor or an agent.
+    fn every_tool_is_a_declared_trust_boundary(): void {
+        reachable = trust_boundaries()
+        assert(reachable.contains("app.main.weather"), "${reachable}")
+        assert(reachable.contains("app.main.distance_km"), "${reachable}")
+        // And nothing else in this program is one — `demo` and `box_or_message` are not reachable
+        // by a model, and the index says so.
+        assert(!reachable.contains("app.main.demo"), "${reachable}")
+    }
+
+    // **A dependency's fixtures must not reach this program's caller.**
+    //
+    // `attributes_of::<Tool>()` is whole-program and closed-world, and "whole program" includes
+    // every dependency package — which is what makes `#[Tool]` work across the package boundary at
+    // all. The same reach is a hazard pointing the other way: a `#[Tool]` declared at module level
+    // anywhere inside `para/tool` would be discovered here and offered to *this* program's model,
+    // with no line of this file mentioning it.
+    //
+    // This is the only side the property can be checked from. A dev tier is active for the entry
+    // file alone, so `para/tool`'s own suite cannot see its fixtures escaping; a consumer can.
+    // Asserted as an exact set, from both directions — the vocabulary a caller is handed, and the
+    // trust-boundary index a reviewer reads — because the thing worth catching is the *next* fixture
+    // someone adds to the library, not today's.
+    fn no_dependency_tool_reaches_this_program(): void {
+        assert(box_or_fail().names() == ["weather", "distance_km"],
+            "a consumer's toolbox is its own tools and nothing else: ${box_or_fail().names()}")
+        assert(trust_boundaries() == ["app.main.weather", "app.main.distance_km"],
+            "and the trust-boundary index agrees: ${trust_boundaries()}")
+        // The same question asked through the door built for it, which names the offender rather
+        // than just disagreeing with an expected list.
+        assert(boundary.declared_outside(["app"]) == [],
+            "a dependency is offering tools to this program: ${boundary.declared_outside(["app"])}")
+    }
+}
+
+// Every function in this program a language model could reach, by name — `roles_of::<Semantic>()`
+// narrowed to the one role `#[Tool]` confers.
+fn trust_boundaries(): List<string> {
+    mut reachable: List<string> = []
+    for r in roles_of::<Semantic>() {
+        if r.role == Semantic.TrustBoundary {
+            reachable = reachable ~ [r.target]
+        }
+    }
+    return reachable
+}
+
+// Unwrap-or-fail, out here because a `match` arm cannot both fail an assertion and produce a value.
+fn box_or_fail(): Toolbox {
+    match Toolbox.of(Local.new()) {
+        Ok(b) => {
+            return b
+        },
+        Err(e) => {
+            assert(false, "building the toolbox failed: ${e}")
+        },
+    }
+    return Toolbox.new()
+}
+
+// The message a call fails with, or a loud failure if it succeeded instead.
+fn failure(box: Toolbox, name: string, args: string): string {
+    match box.call(name, args) {
+        Ok(v) => {
+            assert(false, "`${name}(${args})` must not succeed, got ${v}")
+        },
+        Err(e) => {
+            return "${e}"
+        },
+    }
+    return ""
+}

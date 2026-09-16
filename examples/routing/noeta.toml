@@ -1,0 +1,9 @@
+[package]
+name = "local/routing"
+version = "0.1.0"
+root = "app"
+
+[dependencies]
+# The scope (array) form: it is what makes `para.*` an import root, so `use para.tool` and
+# `use para.tool.boundary` both resolve.
+para = [{ path = "../..", package = "para/tool" }]

@@ -1,0 +1,36 @@
+// The tools a language model may call. Ordinary functions in an ordinary module — what makes them
+// the assistant's set is the module they are declared in, which is the namespace `main.noe` selects.
+use para.tool.{Arg, Tool}
+
+#[Tool(about: "Current weather for a city")]
+pub fn weather(
+    #[Arg(help: "City name, e.g. 'Malmö'")] city: string,
+    #[Arg(help: "`metric` for °C or `imperial` for °F")] units: string = "metric",
+): Result<string, string> {
+    if city == "" {
+        return Err("a city name is required")
+    }
+    return Ok(if units == "imperial" then "64°F and clear in ${city}" else "18°C and clear in ${city}")
+}
+
+#[Tool(about: "Road distance in kilometers between two Swedish cities")]
+pub fn distance_km(
+    #[Arg(help: "The city to start from")] from: string,
+    #[Arg(help: "The city to travel to")] to: string,
+): Result<int, string> {
+    roads = {"Malmö|Lund": 18, "Lund|Malmö": 18, "Malmö|Göteborg": 273}
+    return match roads.get("${from}|${to}") {
+        some(km) => Ok(km),
+        none => Err("no road distance on file for ${from} to ${to}"),
+    }
+}
+
+// A tool the assistant has but the operator console does not — the direction of the asymmetry is
+// worth having in the example, because a selection is not a privilege ladder.
+#[Tool(about: "Summarize a trip in one sentence")]
+pub fn describe_trip(
+    #[Arg(help: "Where the trip starts")] from: string,
+    #[Arg(help: "Where the trip ends")] to: string,
+): string {
+    return "A short hop from ${from} to ${to}."
+}
