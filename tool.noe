@@ -962,8 +962,15 @@ fn first_undispatchable(members: List<Type>, seen: List<string>): ?string {
 }
 
 // A nominal name is an enum exactly when `variants_of` says so — the same pair `nominal_schema`
-// asks. A struct is walked field-wise, guarded by the same chain, so an enum three levels down is
-// refused at the parameter rather than discovered at the first model call.
+// asks, and **this is the arm that does the work**. `params_of` and `field_specs_of` report a
+// declared enum as `Type.Named`, never as `Type.Enum` (measured: `takes_an_enum`'s parameter reflects
+// as `Type.Named(tool.Mood, [])`), so no declaration ever reaches the `Type.Enum` arm above. That arm
+// is the guard for a `Type` value built by hand, where falling through to `_ => none` would answer
+// "dispatchable" for a shape nothing can build. Both are asserted, because an ablation of the
+// `Type.Enum` arm alone left every test green.
+//
+// A struct is walked field-wise, guarded by the same chain, so an enum three levels down is refused
+// at the parameter rather than discovered at the first model call.
 fn undispatchable_nominal(name: string, seen: List<string>): ?string {
     if in_chain(seen, name) {
         return none
@@ -2062,6 +2069,22 @@ fn types_probe(
         // And the schema really does derive, which is what makes that claim checkable rather than
         // an apology.
         assert(type_schema_or_fail(local_target("Mood")) == "{\"enum\":[\"Positive\",\"Negative\",\"Mixed\"],\"type\":\"string\"}")
+    }
+
+    // **Which arm refuses an enum parameter, and why it is not the one you would guess.** Reflection
+    // reports a declared enum kind-agnostically as `Type.Named`, so the `Type.Enum` arm of
+    // `undispatchable` is unreachable from any declaration and `undispatchable_nominal` +
+    // `variants_of` is what fires. Pinned because ablating the `Type.Enum` arm alone left all 46
+    // tests green, which is exactly what an untested arm looks like.
+    fn an_enum_parameter_reflects_as_named_so_the_nominal_arm_is_what_refuses(): void {
+        reflected = params_of(local_target("takes_an_enum"))[0].type
+        assert(reflected == Type.Named(local_target("Mood"), []), "not `Type.Enum`: ${reflected}")
+        // The nominal arm is therefore the one under load, and it does refuse.
+        assert(undispatchable(reflected, []) != none, "the nominal arm carries the refusal")
+        // The hand-built arm refuses too, which is what keeps `_ => none` from meaning
+        // "dispatchable" for a `Type` a consumer assembled rather than read off a declaration.
+        assert(undispatchable(Type.Enum(local_target("Mood"), []), []) != none,
+            "a hand-built `Type.Enum` is refused as well")
     }
 
     // The parameter refusal walks: an enum buried two levels down is caught at the parameter, not
