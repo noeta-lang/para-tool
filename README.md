@@ -3,7 +3,7 @@
 The function signature is the tool spec. Annotate an ordinary Noeta function with `#[Tool]` and this package finds it by whole-program reflection, derives its JSON Schema from the declared parameter types, coerces a caller's arguments to those types, and calls it by name. There is no tool-definition DSL and no codegen, because the language already answers every question one would ask.
 
 ```noeta
-use para.tool.{Arg, Local, Tool, Toolbox}
+use para.tool.{Arg, Local, Tool, Toolbox, ToolError}
 
 #[Tool(about: "Current weather for a city")]
 fn weather(
@@ -13,8 +13,10 @@ fn weather(
     return Ok("18°C and clear in ${city}")
 }
 
-box = Toolbox.of(Local.new())?
-box.call("weather", "{\"city\": \"Lund\"}")   // Ok("18°C and clear in Lund")
+fn answer(): Result<string, ToolError> {
+    box = Toolbox.of(Local.new())?
+    return box.call("weather", "{\"city\": \"Lund\"}")   // Ok("18°C and clear in Lund")
+}
 ```
 
 ## Why it is its own package
@@ -66,7 +68,7 @@ That asks the registry for the current release and writes the caret requirement 
 para = [{ version = "^X.Y", package = "para/tool" }]
 ```
 
-The package is keyed `para`, so its modules address as `para.tool` and `para.tool.boundary`. The array form is what makes `para.*` an import root; the single-table form resolves the package but leaves `use para.tool` unresolvable. It is pure Noeta with no dependencies, so no `[trust]` entry is needed and nothing composes a toolchain.
+The package is keyed `para`, so its modules address as `para.tool` and `para.tool.boundary`. The **array** form matters for a package with more than one module: under the single-table form `use para.tool` resolves and `use para.tool.boundary` is `module \`para.tool\` has no export \`boundary\``. It is pure Noeta with no dependencies, so no `[trust]` entry is needed and nothing composes a toolchain.
 
 ## Selection: one program, two consumers
 
