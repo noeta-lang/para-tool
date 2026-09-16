@@ -541,7 +541,10 @@ fn parse_arguments(name: string, args: string): Result<Map<string, dyn>, ToolErr
         empty: Map<string, dyn> = {}
         return Ok(empty)
     }
-    return match parse_object(trimmed, "tool `${name}` arguments") {
+    // `"arguments"` rather than ``"tool `${name}` arguments"``: `ToolError.Tool`'s own `Display`
+    // already opens with ``tool `weather` failed``, and naming the tool again here produced
+    // ``tool `weather` failed: tool `weather` arguments: invalid JSON: …``.
+    return match parse_object(trimmed, "arguments") {
         Ok(o) => Ok(o),
         // Labeled a tool failure rather than a decode failure: it is the *model's* JSON that was
         // malformed, so the model is who needs to be told.
@@ -559,8 +562,9 @@ fn parse_arguments(name: string, args: string): Result<Map<string, dyn>, ToolErr
 // Never call `json.parse` on a blob that came from a model. An abort here is a crashed process where
 // the whole design is a correction turn.
 //
-// `what` names the document in the error message, so a failure reads
-// ``tool `weather` arguments: invalid JSON: …`` rather than a bare parser complaint.
+// `what` locates the document in the error message, so a failure reads
+// ``arguments: invalid JSON: …`` rather than a bare parser complaint. Keep it purely locational —
+// the caller's own error `Display` supplies the subject, and the parser supplies `invalid JSON`.
 fn parse_object(body: string, what: string): Result<Map<string, dyn>, string> {
     match json.try_parse::<JsonObject>(body) {
         Ok(_) => {},
@@ -583,7 +587,10 @@ struct JsonObject {
 // `parse_object` is too narrow for the general case. Wrapping the fragment in a one-key object
 // reuses the same well-formedness witness: a malformed fragment fails there, with the fragment's own
 // parser message, instead of aborting.
-pub fn parse_value(fragment: string, what: string): Result<dyn, string> {
+//
+// Not `pub`: a consumer parsing JSON has `std.json`, and the one caller outside `parse_arguments` is
+// a test helper in this module. An exported door here would be a second, worse `std.json`.
+fn parse_value(fragment: string, what: string): Result<dyn, string> {
     wrapped = parse_object("{\"v\": " ~ fragment ~ "}", what)?
     return Ok(wrapped.get("v") ?? 0)
 }
@@ -2240,11 +2247,14 @@ fn types_probe(
         assert(call_error("add", "{\"a\": \"two\"}").contains("expected an integer"))
     }
 
-    // A malformed argument blob names the document rather than complaining bare, which is what makes
-    // a parser message readable in a transcript full of other JSON.
-    fn a_malformed_argument_blob_names_the_tool(): void {
+    // A malformed argument blob is located and named **once**. The subject comes from
+    // `ToolError.Tool`'s `Display`, the position from `parse_object`'s label, and `invalid JSON` from
+    // the parser — three layers that each used to want to name the tool.
+    fn a_malformed_argument_blob_is_named_once(): void {
         e = call_error("shout", "{oops")
-        assert(e.contains("tool `shout` arguments"), e)
+        assert(e.starts_with("tool `shout` failed: arguments: invalid JSON:"), e)
+        assert(!e.replace("tool `shout` failed: ", "").contains("shout"),
+            "the tool is named once, not once per layer: ${e}")
     }
 
     // `invoke` takes a positional list and nothing else, so a skipped middle parameter is not

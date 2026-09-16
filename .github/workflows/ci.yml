@@ -1,0 +1,74 @@
+name: CI
+
+# The para/tool package's CI: check + test the package itself and every example with a pinned
+# released `noeta`.
+#
+# **There is deliberately no Rust job here, and no cargo cache.** A sibling repo sets both up because
+# it ships (or depends on something that ships) a native extension crate, which makes the first
+# `noeta check` compose a toolchain — a real cargo build. This package has no dependencies at all and
+# no native code, so nothing composes, there is no Rust to cache, and adding the steps would buy a
+# few minutes of runner time per job in exchange for nothing. If a future change here starts
+# composing a toolchain, that is a dependency edge appearing in a package whose whole design is not
+# to have one: fix the dependency rather than restoring these steps.
+#
+# There is no live-model job either, for the same kind of reason. This layer describes and invokes
+# tools; it never talks to a vendor, so every test in it is hermetic by construction.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Callable as the release gate (release.yml runs the full CI before publishing).
+  workflow_call:
+  # Runnable by hand. A push event is not a guarantee: webhook triggers have been throttled during a
+  # GitHub Actions incident, leaving a pushed branch with no run ever created for it and no way to
+  # ask for one, since a workflow without `workflow_dispatch` cannot be started from the CLI or the
+  # UI. The release rule is that CI must be green on the exact commit before its tag, so a dropped
+  # event must not be able to block a release indefinitely.
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# NOETA_VERSION resolves from the org-level Actions variable of the same name — one bump point for
+# every para repo — falling back to the literal for a fork or a repo the variable has not reached.
+# Bumping is deliberate: raise it here and in `release.yml` together.
+env:
+  NOETA_VERSION: ${{ vars.NOETA_VERSION || 'v0.8.1' }}
+
+jobs:
+  package:
+    name: Package (noeta check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install noeta ${{ env.NOETA_VERSION }}
+        run: |
+          DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
+          echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      - name: noeta check + test every module
+        # `find` rather than `for f in *.noe`: a glob does not recurse, so a module added in a
+        # subdirectory would silently stop being covered the day it moved there. Each module is run
+        # as its own entry on purpose — a dev tier is active for the entry file alone, so a module's
+        # `@test` block only runs when that module is the entry.
+        run: |
+          for f in $(find . -name '*.noe' -not -path './examples/*' | sort); do
+            echo "== ${f}"
+            noeta check "$f"
+            noeta test "$f"
+          done
+      - name: noeta check + test every example
+        # The examples are not decoration here. A dev tier is active for the entry file alone, so
+        # the package's own suite cannot see its `@test`-block fixtures escaping into a consumer —
+        # and a consumer can. `examples/tools` and `examples/routing` each assert that no `#[Tool]`
+        # from this package reaches the program depending on it, which is the one check that fails
+        # if someone adds a module-level `#[Tool]` to this repo.
+        run: |
+          for ex in examples/*/; do
+            echo "== ${ex}"
+            for f in "${ex}"*.noe; do
+              (cd "${ex}" && noeta check "$(basename "$f")" && noeta test "$(basename "$f")")
+            done
+          done
