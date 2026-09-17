@@ -7,10 +7,6 @@ name: Release
 # The sibling packages' shape carries over unchanged. Publishing a pure-Noeta package is the same
 # work whether it has ten dependencies or none: the registry takes the source tree and the tag, and
 # the absence of a dependency graph makes the resolve step shorter rather than different.
-#
-# NOTE: the repository URL below is this package's intended home under the `noeta-lang` org,
-# following every sibling's naming. Nothing publishes until that remote exists and a `v*` tag is
-# pushed to it.
 
 on:
   push:
